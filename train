@@ -26,9 +26,7 @@ import PIL.Image
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 
 import utils
-import models.swin as swin
-import models.vmae as vmae
-import models.timesformer_hug as timesformer_hug
+import swin 
 
 from pytorch_lightning.utilities import rank_zero_only
 import csv
