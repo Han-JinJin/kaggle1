@@ -1,0 +1,859 @@
+import os
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import numpy as np
+import glob
+import torchvision.transforms as T
+from PIL import Image
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback
+from pytorch_lightning.loggers import WandbLogger
+import wandb
+from torch.utils.data import DataLoader
+import random
+import cv2
+from tqdm.auto import tqdm
+from torch.optim import AdamW
+import segmentation_models_pytorch as smp
+from torch.utils.data import DataLoader, Dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from warmup_scheduler import GradualWarmupScheduler
+import PIL.Image
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
+
+import utils
+import models.swin as swin
+import models.vmae as vmae
+import models.timesformer_hug as timesformer_hug
+
+from pytorch_lightning.utilities import rank_zero_only
+import csv
+import json
+from datetime import datetime
+import datetime as _dt
+
+print = rank_zero_only(print)
+
+
+def parse_args():
+    """Parse command line arguments for configurable training"""
+    parser = argparse.ArgumentParser(description='Vesuvius Ink Detection Training')
+
+    # Model configuration
+    parser.add_argument('--model', type=str, default='swin',
+                        choices=['swin', 'vmae', 'timesformer_hug', 'resnet'],
+                        help='Model architecture to use')
+
+    # Data configuration
+    parser.add_argument('--segment_path', type=str, default='./train_scrolls/',
+                        help='Path to training scrolls')
+    parser.add_argument('--segments', type=str, nargs='+', default=['remaining5', 'rect5'],
+                        help='Segments to train on')
+    parser.add_argument('--valid_id', type=str, default='rect5',
+                        help='Validation segment ID')
+
+    # Input configuration
+    parser.add_argument('--start_idx', type=int, default=24,
+                        help='Starting index for layers')
+    parser.add_argument('--in_chans', type=int, default=16,
+                        help='Number of input channels')
+    parser.add_argument('--valid_chans', type=int, default=16,
+                        help='Number of validation channels')
+
+    # Image/tile configuration
+    parser.add_argument('--size', type=int, default=64,
+                        help='Input image size')
+    parser.add_argument('--tile_size', type=int, default=64,
+                        help='Tile size for processing')
+    parser.add_argument('--stride_divisor', type=int, default=4,
+                        help='Divisor for stride calculation (stride = tile_size // stride_divisor)')
+
+    # Training hyperparameters
+    parser.add_argument('--train_batch_size', type=int, default=50,
+                        help='Training batch size')
+    parser.add_argument('--valid_batch_size', type=int, default=50,
+                        help='Validation batch size')
+    parser.add_argument('--lr', type=float, default=5e-5,
+                        help='Learning rate')
+    parser.add_argument('--min_lr', type=float, default=1e-7,
+                        help='Minimum learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-6,
+                        help='Weight decay')
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        choices=['cosine', 'linear'],
+                        help='Learning rate scheduler')
+    parser.add_argument('--epochs', type=int, default=25,
+                        help='Number of training epochs')
+    parser.add_argument('--warmup_factor', type=int, default=10,
+                        help='Warmup factor for learning rate')
+
+    # Fragment scaling
+    parser.add_argument('--frags_ratio1', type=str, nargs='+', default=['Frag', 're'],
+                        help='Fragment identifiers for ratio1 scaling')
+    parser.add_argument('--frags_ratio2', type=str, nargs='+', default=['s4', '202', 'left'],
+                        help='Fragment identifiers for ratio2 scaling')
+    parser.add_argument('--ratio1', type=int, default=2,
+                        help='Scaling ratio for frags_ratio1')
+    parser.add_argument('--ratio2', type=int, default=1,
+                        help='Scaling ratio for frags_ratio2')
+
+    # Augmentation and normalization
+    parser.add_argument('--norm', type=lambda x: str(x).lower() == 'true', default=True,
+                        help='Apply normalization')
+    parser.add_argument('--aug', type=str, default='fourth',
+                        choices=['none', 'shift', 'fourth', 'None'],
+                        help='Augmentation type')
+
+    # System configuration
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of data loading workers')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Random seed')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='Maximum gradient norm for clipping')
+
+    # Output configuration
+    parser.add_argument('--comp_name', type=str, default='vesuvius',
+                        help='Competition name for output path')
+    parser.add_argument('--wandb_project', type=str, default='vesuvius',
+                        help='Weights & Biases project name')
+
+    # Training loop configuration
+    parser.add_argument('--multi_segment_training', action='store_true',
+                        help='Train on multiple segment combinations in sequence')
+    parser.add_argument('--segment_combinations', type=str, default=None,
+                        help='JSON string of segment combinations for multi-training')
+
+    # PyTorch Lightning trainer configuration
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=4,
+                        help='Run validation every N epochs')
+    parser.add_argument('--accumulate_grad_batches', type=int, default=1,
+                        help='Gradient accumulation batches')
+    parser.add_argument('--precision', type=str, default='16',
+                        help='Training precision')
+    parser.add_argument('--devices', type=int, default=-1,
+                        help='Number of GPUs (-1 for all)')
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_true',
+                        help='Distributed training strategy')
+
+    # Model-specific parameters
+    parser.add_argument('--freeze', action='store_true',
+                        help='Freeze model backbone')
+    parser.add_argument('--out_chans', type=int, default=1,
+                        help='Number of output channels')
+    parser.add_argument('--scale_factor', type=int, default=8,
+                        help='Scale factor for output')
+
+    # Checkpoint configuration
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--save_top_k', type=int, default=-1,
+                        help='Save top k models (-1 for all)')
+
+    return parser.parse_args()
+
+
+class CFG:
+    """Configuration class that can be initialized from args"""
+
+    @staticmethod
+    def from_args(args):
+        """Create CFG instance from parsed arguments"""
+        cfg = CFG()
+
+        # Copy all arguments to CFG
+        for key, value in vars(args).items():
+            setattr(cfg, key, value)
+
+        # Calculate derived values
+        cfg.stride = cfg.tile_size // cfg.stride_divisor
+        # base outputs path (we will create run subfolders inside this)
+        cfg.outputs_path = f'./outputs'
+        # default model_dir will be updated per-run
+        cfg.model_dir = os.path.join(cfg.outputs_path, f'{cfg.comp_name}-models')
+        cfg.current_dir = './'
+
+        # Convert aug 'None' string to None
+        if cfg.aug == 'None':
+            cfg.aug = None
+
+        # Set augmentation lists
+        cfg.train_aug_list = [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.75),
+            A.ShiftScaleRotate(rotate_limit=360, shift_limit=0.15, scale_limit=0.1, p=0.75),
+            A.OneOf([
+                A.GaussNoise(var_limit=[10, 50]),
+                A.GaussianBlur(),
+                A.MotionBlur(),
+            ], p=0.4),
+            A.CoarseDropout(max_holes=5, max_width=int(cfg.size * 0.1),
+                          max_height=int(cfg.size * 0.2),
+                          mask_fill_value=0, p=0.5),
+            ToTensorV2(transpose_mask=True),
+        ]
+
+        cfg.valid_aug_list = [
+            ToTensorV2(transpose_mask=True),
+        ]
+
+        return cfg
+
+
+def get_transforms(data, cfg):
+    """Get data transforms based on split type"""
+    if data == 'train':
+        aug = A.Compose(cfg.train_aug_list)
+    elif data == 'valid':
+        aug = A.Compose(cfg.valid_aug_list)
+    return aug
+
+
+def get_model(cfg, pred_shape, wandb_logger):
+    """Get model based on configuration"""
+    model_params = {
+        'pred_shape': pred_shape,
+        'size': cfg.size,
+        'lr': cfg.lr,
+        'scheduler': cfg.scheduler,
+        'wandb_logger': wandb_logger,
+        'freeze': cfg.freeze
+    }
+
+    if cfg.model == 'swin':
+        model = swin.SwinModel(**model_params)
+    elif cfg.model == 'vmae':
+        model = vmae.VideoMaeModel(**model_params)
+    elif cfg.model == 'timesformer_hug':
+        model = timesformer_hug.TimesfomerModel(**model_params)
+    elif cfg.model == 'resnet':
+        # Import resnet model if available
+        try:
+            import models.resnetall as resnetall
+            model = resnetall.ResNetModel(**model_params)
+        except (ImportError, AttributeError):
+            raise ValueError(f"ResNet model not properly configured. Check models/resnetall.py")
+    else:
+        raise ValueError(f"Unknown model type: {cfg.model}")
+
+    return model
+
+
+def get_dataset(cfg, images, masks=None, xyxys=None, data_type='train'):
+    """Get dataset based on model type and configuration"""
+    transform = get_transforms(data_type, cfg)
+
+    # Common parameters
+    dataset_params = {
+        'labels': masks,
+        'transform': transform,
+    }
+
+    # Add xyxys for validation
+    if xyxys is not None:
+        dataset_params['xyxys'] = xyxys
+
+    if cfg.model in ['swin', 'vmae', 'resnet']:
+        # VideoDataset with additional parameters
+        dataset_params.update({
+            'norm': cfg.norm,
+            'aug': cfg.aug,
+            'out_chans': cfg.out_chans,
+            'scale_factor': cfg.scale_factor
+        })
+        dataset = utils.VideoDataset(images, cfg, **dataset_params)
+
+    return dataset
+
+
+def prepare_validation_mask(cfg, fragment_id):
+    """Prepare validation mask with proper scaling"""
+    valid_mask_gt = cv2.imread(f"{cfg.segment_path}{fragment_id}/layers/32.tif", 0)
+
+    # Apply fragment-specific scaling
+    if any(sub in fragment_id for sub in cfg.frags_ratio1):
+        scale = 1 / cfg.ratio1
+        new_w = int(valid_mask_gt.shape[1] * scale)
+        new_h = int(valid_mask_gt.shape[0] * scale)
+        valid_mask_gt = cv2.resize(valid_mask_gt, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    elif any(sub in fragment_id for sub in cfg.frags_ratio2):
+        scale = 1 / cfg.ratio2
+        new_w = int(valid_mask_gt.shape[1] * scale)
+        new_h = int(valid_mask_gt.shape[0] * scale)
+        valid_mask_gt = cv2.resize(valid_mask_gt, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    return valid_mask_gt
+
+
+# ---------------------------
+# Run folder & config saving
+# ---------------------------
+def create_run_dir(cfg, run_slug):
+    """Create unique run folder inside cfg.outputs_path and return it."""
+    base = cfg.outputs_path if hasattr(cfg, 'outputs_path') else './outputs'
+    os.makedirs(base, exist_ok=True)
+
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Make small friendly name
+    safe_slug = run_slug.replace(' ', '').replace('/', '_').replace('\'', '')
+    run_dir = os.path.join(base, f"{safe_slug}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    return run_dir
+
+
+def serialize_cfg(cfg):
+    """Convert config to a JSON-serializable dict (fallback to str for non-serializable)."""
+    cfg_dict = {}
+    # prefer __dict__ when available
+    if hasattr(cfg, '__dict__'):
+        items = cfg.__dict__.items()
+    else:
+        items = [(k, getattr(cfg, k)) for k in dir(cfg) if not k.startswith('_')]
+    for k, v in items:
+        try:
+            json.dumps(v)
+            cfg_dict[k] = v
+        except Exception:
+            try:
+                # numpy arrays -> list
+                if isinstance(v, np.ndarray):
+                    cfg_dict[k] = v.tolist()
+                else:
+                    cfg_dict[k] = str(v)
+            except Exception:
+                cfg_dict[k] = str(v)
+    return cfg_dict
+
+
+@rank_zero_only
+def save_config(cfg, run_dir, run_slug):
+    """Save configuration to run_dir safely (rank 0 only)."""
+    os.makedirs(run_dir, exist_ok=True)
+    cfg_dict = serialize_cfg(cfg)
+    config_path = os.path.join(run_dir, f'{run_slug}_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(cfg_dict, f, indent=4)
+    print(f"Configuration saved to: {config_path}")
+
+
+@rank_zero_only
+def save_results(model, trainer, run_dir, run_slug, cfg):
+    """Save final training results (metrics) to JSON and append to CSV (final snapshot)."""
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Collect basic run info
+    results = {
+        'run_slug': run_slug,
+        'model': cfg.model,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'segments': str(cfg.segments),
+        'valid_id': cfg.valid_id,
+        'size': cfg.size,
+        'lr': cfg.lr,
+        'epochs': cfg.epochs,
+        'train_batch_size': cfg.train_batch_size,
+    }
+
+    # Combine metrics
+    if hasattr(trainer, 'callback_metrics'):
+        for key, value in trainer.callback_metrics.items():
+            try:
+                if isinstance(value, torch.Tensor):
+                    results[key] = float(value.cpu().item())
+                else:
+                    results[key] = float(value) if isinstance(value, (int, float)) else str(value)
+            except Exception:
+                results[key] = str(value)
+
+    if hasattr(trainer, 'logged_metrics'):
+        for key, value in trainer.logged_metrics.items():
+            if key not in results:
+                try:
+                    if isinstance(value, torch.Tensor):
+                        results[key] = float(value.cpu().item())
+                    else:
+                        results[key] = float(value) if isinstance(value, (int, float)) else str(value)
+                except Exception:
+                    results[key] = str(value)
+
+    # Save to JSON
+    json_path = os.path.join(run_dir, f'{run_slug}_results.json')
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=4)
+    print(f"Results saved to: {json_path}")
+
+    # Append to a global outputs summary csv (top-level outputs folder)
+    csv_path = os.path.join(cfg.outputs_path, 'all_results.csv')
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=results.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(results)
+    print(f"Results appended to: {csv_path}")
+
+
+def compute_metrics(preds, targets, threshold=0.5):
+    """
+    Compute segmentation metrics: dice, IoU, precision, recall, F1, accuracy
+
+    Args:
+        preds: predictions (B, H, W) or (B, 1, H, W) - values between 0 and 1
+        targets: ground truth (B, H, W) or (B, 1, H, W) - binary 0 or 1
+        threshold: threshold for binarizing predictions
+
+    Returns:
+        dict of metrics
+    """
+    # Ensure tensors
+    if not isinstance(preds, torch.Tensor):
+        preds = torch.tensor(preds)
+    if not isinstance(targets, torch.Tensor):
+        targets = torch.tensor(targets)
+
+    # Flatten to (B, -1) and move to CPU
+    preds = preds.flatten(1).cpu()
+    targets = targets.flatten(1).cpu()
+
+    # Binarize predictions
+    preds_binary = (preds > threshold).float()
+    targets_binary = targets.float()
+
+    # Compute confusion matrix components
+    tp = (preds_binary * targets_binary).sum(dim=1)
+    fp = (preds_binary * (1 - targets_binary)).sum(dim=1)
+    fn = ((1 - preds_binary) * targets_binary).sum(dim=1)
+    tn = ((1 - preds_binary) * (1 - targets_binary)).sum(dim=1)
+
+    # Avoid division by zero
+    eps = 1e-7
+
+    # Dice coefficient (F1 for binary)
+    dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+
+    # IoU (Jaccard)
+    iou = (tp + eps) / (tp + fp + fn + eps)
+
+    # Precision
+    precision = (tp + eps) / (tp + fp + eps)
+
+    # Recall (Sensitivity)
+    recall = (tp + eps) / (tp + fn + eps)
+
+    # F1 Score (same as dice for binary)
+    f1 = (2 * precision * recall + eps) / (precision + recall + eps)
+
+    # Accuracy
+    accuracy = (tp + tn + eps) / (tp + fp + fn + tn + eps)
+
+    # Average across batch
+    metrics = {
+        'dice': dice.mean().item(),
+        'iou': iou.mean().item(),
+        'precision': precision.mean().item(),
+        'recall': recall.mean().item(),
+        'f1': f1.mean().item(),
+        'accuracy': accuracy.mean().item(),
+    }
+
+    return metrics
+
+
+class MetricsCSVCallback(Callback):
+    """
+    Callback that computes and logs detailed metrics (dice, IoU, precision, recall, F1, accuracy)
+    after every validation epoch and saves to CSV.
+    Only rank 0 writes to disk.
+    """
+
+    def __init__(self, run_dir, run_slug, csv_name='metrics.csv', threshold=0.5):
+        super().__init__()
+        self.run_dir = run_dir
+        self.run_slug = run_slug
+        self.threshold = threshold
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.run_dir, csv_name)
+        self.all_preds = []
+        self.all_targets = []
+
+    @rank_zero_only
+    def _write_row(self, row, fieldnames):
+        file_exists = os.path.exists(self.csv_path)
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        """Collect predictions and targets during validation"""
+        if outputs is not None and isinstance(outputs, dict):
+            # Try to get predictions from outputs
+            if 'preds' in outputs:
+                preds = outputs['preds']
+            elif 'logits' in outputs:
+                preds = torch.sigmoid(outputs['logits'])
+            else:
+                return
+
+            if 'targets' in outputs:
+                targets = outputs['targets']
+            elif len(batch) >= 2:
+                targets = batch[1]
+            else:
+                return
+
+            self.all_preds.append(preds.detach().cpu())
+            self.all_targets.append(targets.detach().cpu())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """
+        Compute metrics from collected predictions and save to CSV
+        """
+        epoch = int(trainer.current_epoch) if hasattr(trainer, 'current_epoch') else None
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Compute custom metrics if we have predictions
+        custom_metrics = {}
+        if self.all_preds and self.all_targets:
+            try:
+                all_preds_tensor = torch.cat(self.all_preds, dim=0)
+                all_targets_tensor = torch.cat(self.all_targets, dim=0)
+                custom_metrics = compute_metrics(all_preds_tensor, all_targets_tensor, self.threshold)
+                custom_metrics = {f'custom_{k}': v for k, v in custom_metrics.items()}
+            except Exception as e:
+                print(f"Warning: Could not compute custom metrics: {e}")
+
+            # Clear for next epoch
+            self.all_preds = []
+            self.all_targets = []
+
+        # Get metrics from trainer
+        candidate_metrics = {}
+        if hasattr(trainer, 'callback_metrics'):
+            candidate_metrics.update(trainer.callback_metrics)
+        if hasattr(trainer, 'logged_metrics'):
+            for k, v in trainer.logged_metrics.items():
+                if k not in candidate_metrics:
+                    candidate_metrics[k] = v
+
+        metrics = {}
+        for k, v in candidate_metrics.items():
+            if k is None:
+                continue
+            try:
+                if isinstance(v, torch.Tensor):
+                    metrics[k] = float(v.cpu().detach().item())
+                elif isinstance(v, (int, float, np.floating, np.integer)):
+                    metrics[k] = float(v)
+                else:
+                    metrics[k] = str(v)
+            except Exception:
+                try:
+                    metrics[k] = float(v)
+                except Exception:
+                    metrics[k] = str(v)
+
+        # Merge custom metrics
+        metrics.update(custom_metrics)
+
+        # Build row
+        row = {'epoch': epoch, 'timestamp': ts, 'run_slug': self.run_slug}
+        row.update(metrics)
+
+        # Fixed column order: epoch, timestamp, run_slug, then metrics alphabetically
+        fieldnames = ['epoch', 'timestamp', 'run_slug'] + sorted([k for k in metrics.keys()])
+        self._write_row(row, fieldnames)
+
+        # Also print metrics to console
+        if custom_metrics:
+            print(f"\nEpoch {epoch} Metrics:")
+            for k, v in sorted(custom_metrics.items()):
+                print(f"  {k}: {v:.4f}")
+
+
+class CSVLoggerCallback(Callback):
+    """
+    Simple callback that logs all trainer metrics to CSV
+    (kept for compatibility, but MetricsCSVCallback is more comprehensive)
+    """
+
+    def __init__(self, run_dir, run_slug, csv_name='val_metrics.csv'):
+        super().__init__()
+        self.run_dir = run_dir
+        self.run_slug = run_slug
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.run_dir, csv_name)
+
+    @rank_zero_only
+    def _write_row(self, row, fieldnames):
+        file_exists = os.path.exists(self.csv_path)
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """
+        Called at the end of validation epoch. Collects metrics from trainer.callback_metrics.
+        """
+        epoch = int(trainer.current_epoch) if hasattr(trainer, 'current_epoch') else None
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        candidate_metrics = {}
+        if hasattr(trainer, 'callback_metrics'):
+            candidate_metrics.update(trainer.callback_metrics)
+        if hasattr(trainer, 'logged_metrics'):
+            for k, v in trainer.logged_metrics.items():
+                if k not in candidate_metrics:
+                    candidate_metrics[k] = v
+
+        metrics = {}
+        for k, v in candidate_metrics.items():
+            if k is None:
+                continue
+            try:
+                if isinstance(v, torch.Tensor):
+                    metrics[k] = float(v.cpu().detach().item())
+                elif isinstance(v, (int, float, np.floating, np.integer)):
+                    metrics[k] = float(v)
+                else:
+                    metrics[k] = str(v)
+            except Exception:
+                try:
+                    metrics[k] = float(v)
+                except Exception:
+                    metrics[k] = str(v)
+
+        row = {'epoch': epoch, 'timestamp': ts, 'run_slug': self.run_slug}
+        row.update(metrics)
+        fieldnames = ['epoch', 'timestamp', 'run_slug'] + sorted([k for k in metrics.keys()])
+        self._write_row(row, fieldnames)
+
+
+# def train_single_fold(cfg, segments, valid_id):
+#     """Train on a single fold/segment combination"""
+
+#     # End any existing W&B run before starting new one
+#     if wandb.run is not None:
+#         wandb.finish()
+
+#     # Update configuration for this fold
+#     cfg.segments = segments
+#     cfg.valid_id = valid_id
+#     fragment_id = cfg.valid_id
+
+#     # Create run slug early (used to create run dir)
+#     run_slug = (f'{cfg.model.upper()}_{cfg.segments}_valid={cfg.valid_id}_'
+#                 f'size={cfg.size}_lr={cfg.lr}_in_chans={cfg.valid_chans}_'
+#                 f'norm={cfg.norm}_aug={cfg.aug}')
+
+#     # Create run directory (unique)
+#     run_dir = create_run_dir(cfg, run_slug)
+#     # update cfg paths for this run
+#     cfg.run_dir = run_dir
+#     cfg.model_dir = os.path.join(run_dir, 'models')
+#     os.makedirs(cfg.model_dir, exist_ok=True)
+
+#     print(f"\n{'='*80}")
+#     print(f"Training: {run_slug}")
+#     print(f"Run folder: {run_dir}")
+#     print(f"{'='*80}\n")\
+
+def train_single_fold(cfg, segments, valid_id):
+    """Train on a single fold/segment combination"""
+
+    # End any existing W&B run before starting new one
+    if wandb.run is not None:
+        wandb.finish()
+
+    # Update configuration for this fold
+    cfg.segments = segments
+    cfg.valid_id = valid_id
+    fragment_id = cfg.valid_id
+
+    # --------------------------------------------------
+    # Create run slug FIRST
+    # --------------------------------------------------
+    run_slug = (
+        f"{cfg.model.upper()}_{cfg.segments}_valid={cfg.valid_id}_"
+        f"size={cfg.size}_version"
+    )
+
+    # --------------------------------------------------
+    # Create run directory AFTER run_slug is built
+    # --------------------------------------------------
+    run_dir = create_run_dir(cfg, run_slug)
+
+    # Force everything (checkpoints, logs, config) into this directory
+    cfg.model_dir = run_dir
+
+    print(f"\n{'='*80}")
+    print(f"Training: {run_slug}")
+    print(f"Saving to directory: {cfg.model_dir}")
+    print(f"{'='*80}\n")
+
+
+    # Prepare validation mask
+    valid_mask_gt = prepare_validation_mask(cfg, fragment_id)
+    pred_shape = valid_mask_gt.shape
+
+    # Get train/valid datasets
+    train_images, train_masks, valid_images, valid_masks, valid_xyxys = utils.get_train_valid_dataset(cfg)
+
+    print(f'Train images shape: {train_images[0].shape}')
+    print(f"Number of train images: {len(train_images)}")
+
+    valid_xyxys = np.stack(valid_xyxys)
+
+    # Create datasets
+    train_dataset = get_dataset(cfg, train_images, train_masks, data_type='train')
+    valid_dataset = get_dataset(cfg, valid_images, valid_masks, valid_xyxys, data_type='valid')
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.train_batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=cfg.valid_batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    print(f"Train loader length: {len(train_loader)}")
+    print(f"Valid loader length: {len(valid_loader)}")
+
+    # Initialize W&B logger
+    wandb_logger = WandbLogger(project=cfg.wandb_project, name=run_slug)
+
+    # Create model
+    model = get_model(cfg, pred_shape, wandb_logger)
+
+    # Load checkpoint if provided
+    if cfg.checkpoint_path:
+        print(f"Loading checkpoint from: {cfg.checkpoint_path}")
+        if cfg.model == 'swin':
+            model = swin.load_weights(model, cfg.checkpoint_path)
+        elif cfg.model == 'vmae':
+            model = vmae.load_weights(model, cfg.checkpoint_path)
+        elif cfg.model == 'timesformer_hug':
+            model = timesformer_hug.load_weights(model, cfg.checkpoint_path)
+
+    # Watch model with W&B
+    wandb_logger.watch(model, log="all", log_freq=50, log_graph=False)
+
+    # Setup callbacks
+    callbacks = []
+    if cfg.save_top_k != 0:
+        checkpoint_callback = ModelCheckpoint(
+            filename=f'{run_slug}_' + '{epoch}',
+            dirpath=cfg.model_dir,
+            monitor='train/total_loss',
+            mode='min',
+            save_top_k=cfg.save_top_k if cfg.save_top_k > 0 else cfg.epochs,
+        )
+        callbacks.append(checkpoint_callback)
+
+    # Add comprehensive metrics callback (dice, IoU, precision, recall, F1, accuracy)
+    metrics_cb = MetricsCSVCallback(run_dir=run_dir, run_slug=run_slug, csv_name='metrics.csv', threshold=0.5)
+    callbacks.append(metrics_cb)
+
+    # Also add simple CSV logger for all trainer metrics
+    csv_logger_cb = CSVLoggerCallback(run_dir=run_dir, run_slug=run_slug, csv_name='val_metrics.csv')
+    callbacks.append(csv_logger_cb)
+
+    # Create trainer; set default_root_dir to run_dir so Lightning artifacts go there
+    trainer = pl.Trainer(
+        max_epochs=cfg.epochs,
+        accelerator="gpu",
+        check_val_every_n_epoch=cfg.check_val_every_n_epoch,
+        devices=cfg.devices,
+        logger=wandb_logger,
+        default_root_dir=run_dir,
+        accumulate_grad_batches=cfg.accumulate_grad_batches,
+        precision=cfg.precision,
+        gradient_clip_val=cfg.max_grad_norm,
+        gradient_clip_algorithm="norm",
+        strategy=cfg.strategy,
+        callbacks=callbacks if callbacks else None,
+    )
+
+    # Train
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+
+    # Save configuration and final results into run_dir (rank 0 only)
+    save_config(cfg, run_dir, run_slug)
+    save_results(model, trainer, run_dir, run_slug, cfg)
+
+    # Finish W&B run
+    wandb.finish()
+
+    print(f"\nCompleted training: {run_slug}\n")
+
+
+def main():
+    """Main training function"""
+    # Parse arguments
+    args = parse_args()
+
+    # Create configuration
+    CFG_instance = CFG.from_args(args)
+
+    # Initialize utilities
+    utils.cfg_init(CFG_instance)
+    torch.set_float32_matmul_precision('medium')
+
+    # End any existing W&B run
+    if wandb.run is not None:
+        wandb.finish()
+
+    # Check if multi-segment training is enabled
+    if args.multi_segment_training and args.segment_combinations:
+        import json as _json
+        segment_combinations = _json.loads(args.segment_combinations)
+
+        print(f"\nMulti-segment training enabled with {len(segment_combinations)} combinations\n")
+
+        for i, (segments, valid_id) in enumerate(segment_combinations, 1):
+            print(f"\n{'#'*80}")
+            print(f"# Training combination {i}/{len(segment_combinations)}")
+            print(f"{'#'*80}\n")
+            train_single_fold(CFG_instance, segments, valid_id)
+
+    else:
+        # Single training run
+        train_single_fold(CFG_instance, CFG_instance.segments, CFG_instance.valid_id)
+
+    # Final cleanup
+    @rank_zero_only
+    def finish_wandb():
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+
+    finish_wandb()
+    print("\n" + "="*80)
+    print("Training completed!")
+    print("="*80 + "\n")
+
+
+if __name__ == "__main__":
+    main()
