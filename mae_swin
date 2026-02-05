@@ -1,0 +1,567 @@
+"""
+Adapted MAE Training Script using Custom Swin3D from Scratch
+Integrates with existing data pipeline and PyTorch Lightning
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import torch.distributed as dist
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+from warmup_scheduler import GradualWarmupScheduler
+
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, random_split
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import torchvision.transforms as T
+import random
+import cv2
+from tqdm.auto import tqdm
+
+# Import our custom Swin3D components
+import sys
+sys.path.append('./')
+from swin3d_transformer import (
+    SwinTransformer3D,
+    PatchEmbedding3D,
+    BasicLayer3D,
+    PatchMerging3D,
+)
+
+PIL_Image_MAX_IMAGE_PIXELS = 933120000
+
+
+class CFG:
+    # ============== comp exp name =============
+    current_dir = '../'
+    segment_path = './pretraining_scrolls/'
+    
+    start_idx = 20
+    in_chans = 20
+    valid_chans = 16  # chans used 
+    
+    size = 224
+    tile_size = 224
+    stride = tile_size // 1
+    
+    train_batch_size = 10
+    valid_batch_size = 5
+    lr = 1e-4
+    
+    # ============== model cfg =============
+    scheduler = 'cosine'
+    epochs = 16
+    warmup_factor = 10
+    
+    # Change the size of fragments
+    frags_ratio1 = ['frag', 're']
+    frags_ratio2 = ['202', 's4', 'left']
+    ratio1 = 2
+    ratio2 = 1
+    
+    # ============== valid =============
+    segments = ['20240304141531'] 
+    valid_id = '20240304141531'
+    
+    # ============== fixed =============
+    min_lr = 1e-7
+    weight_decay = 1e-6
+    max_grad_norm = 100
+    num_workers = 16
+    seed = 0
+        
+    # ============== augmentation =============
+    train_aug_list = [
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.ShiftScaleRotate(rotate_limit=360, shift_limit=0.15, p=0.75),
+        ToTensorV2(transpose_mask=True),
+    ]
+
+    valid_aug_list = [
+        ToTensorV2(transpose_mask=True),  
+    ]
+    
+
+def get_transforms(data, cfg):
+    if data == 'train':
+        aug = A.Compose(cfg.train_aug_list)
+    elif data == 'valid':
+        aug = A.Compose(cfg.valid_aug_list)
+    return aug
+
+
+class TileDataset(Dataset):
+    def __init__(self, base_path, splits=["train"], transform=None):
+        self.tile_paths = []
+        for split in splits:
+            split_path = os.path.join(base_path, "224_tiles", split)
+            self.tile_paths += [
+                os.path.join(split_path, f) 
+                for f in os.listdir(split_path) if f.endswith(".npy")
+            ]
+
+        self.transform = transform
+        self.video_transform = T.Compose([
+            T.ConvertImageDtype(torch.float32), 
+            T.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+    def __len__(self):
+        return len(self.tile_paths)
+    
+    def fourth_augment(self, image):
+        cropping_num = CFG.valid_chans  # Number of channels to crop
+        start_idx = random.randint(0, CFG.in_chans - cropping_num)
+        crop_indices = np.arange(start_idx, start_idx + cropping_num)
+        return image[..., crop_indices]
+
+    def __getitem__(self, idx):
+        image = np.load(self.tile_paths[idx])  # H x W x C
+        image = self.fourth_augment(image)          
+        if self.transform:
+            data = self.transform(image=image)
+            image = data['image'].unsqueeze(0)
+        image = image.permute(1, 0, 2, 3)
+        image = torch.stack([self.video_transform(f) for f in image])
+        return image
+
+
+def visualize_reconstruction(original, reconstructed, sample_idx=0, num_frames=16, 
+                            save_path='./results/reconstruction.png', epoch=0):
+    """Visualize original and reconstructed video frames side by side."""
+    orig = original[sample_idx]     # (T, C, H, W)
+    recon = reconstructed[sample_idx]  # (T, C, H, W)
+
+    # If grayscale, squeeze channel dim
+    if orig.shape[1] == 1:
+        orig = orig.squeeze(1)
+        recon = recon.squeeze(1)
+
+    # Clamp and convert to numpy
+    orig = orig.cpu().numpy()
+    recon = recon.cpu().detach().numpy()
+
+    fig, axes = plt.subplots(2, num_frames, figsize=(3 * num_frames, 6))
+
+    for i in range(num_frames):
+        # Original frame
+        ax = axes[0, i]
+        ax.imshow(orig[i], cmap='gray')
+        ax.set_title(f"Original Frame {i}")
+        ax.axis('off')
+
+        # Reconstructed frame
+        ax = axes[1, i]
+        ax.imshow(recon[i], cmap='gray')
+        ax.set_title(f"Reconstructed Frame {i}")
+        ax.axis('off')
+
+    os.makedirs(os.path.dirname(f'./results/reconstruction_swin3d_{epoch}.png'), exist_ok=True)
+    plt.savefig(f'./results/reconstruction_swin3d_{epoch}.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+class Swin3DMAE(pl.LightningModule):
+    """
+    3D Video MAE using custom Swin3D Transformer built from scratch
+    """
+    
+    def __init__(self, 
+                 img_size=(16, 64, 64),
+                 patch_size=(2, 4, 4),
+                 in_channels=1,
+                 embed_dim=96,
+                 depths=(2, 2, 6, 2),
+                 num_heads=(3, 6, 12, 24),
+                 window_size=(8, 7, 7),
+                 decoder_embed_dim=512,
+                 decoder_depth=4,
+                 decoder_num_heads=8,
+                 mask_ratio=0.75,
+                 lr=1e-4):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.mask_ratio = mask_ratio
+        self.in_channels = in_channels
+        
+        # Calculate patch grid
+        self.patch_grid = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+            img_size[2] // patch_size[2]
+        )
+        self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
+        print(f"Patch grid: {self.patch_grid}, Total patches: {self.num_patches}")
+        
+        # ========== ENCODER: Swin3D Transformer ==========
+        self.encoder = SwinTransformer3D(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            num_classes=0,  # No classification head
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+        )
+        
+        # Get encoder output dimension (after all stages)
+        self.encoder_dim = int(embed_dim * 2 ** (len(depths) - 1))
+        
+        # Calculate encoder output resolution
+        self.encoder_output_resolution = (
+            self.patch_grid[0] // (2 ** (len(depths) - 1)),
+            self.patch_grid[1] // (2 ** (len(depths) - 1)),
+            self.patch_grid[2] // (2 ** (len(depths) - 1))
+        )
+        self.encoder_output_patches = (
+            self.encoder_output_resolution[0] * 
+            self.encoder_output_resolution[1] * 
+            self.encoder_output_resolution[2]
+        )
+        print(f"Encoder output resolution: {self.encoder_output_resolution}")
+        print(f"Encoder output patches: {self.encoder_output_patches}")
+        
+        # ========== DECODER ==========
+        self.decoder_embed = nn.Linear(self.encoder_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        
+        # Positional embedding for full sequence
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches, decoder_embed_dim)
+        )
+        
+        # Transformer decoder
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=decoder_embed_dim,
+            nhead=decoder_num_heads,
+            dim_feedforward=decoder_embed_dim * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
+        
+        # Prediction head
+        patch_dim = patch_size[0] * patch_size[1] * patch_size[2] * in_channels
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_dim)
+        
+        # Loss
+        self.criterion = nn.MSELoss()
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.decoder_pos_embed, std=0.02)
+        nn.init.normal_(self.decoder_pred.weight, std=0.02)
+        nn.init.constant_(self.decoder_pred.bias, 0)
+    
+    def patchify(self, x):
+        """
+        Convert video to patches.
+        x: (B, C, D, H, W)
+        Returns: (B, num_patches, patch_dim)
+        """
+        B, C, D, H, W = x.shape
+        pd, ph, pw = self.patch_size
+        
+        # Reshape to patches
+        x = x.reshape(B, C, 
+                     D // pd, pd,
+                     H // ph, ph,
+                     W // pw, pw)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+        x = x.reshape(B, -1, C * pd * ph * pw)
+        
+        return x
+    
+    def unpatchify(self, x):
+        """
+        Convert patches back to video.
+        x: (B, num_patches, patch_dim)
+        Returns: (B, C, D, H, W)
+        """
+        B = x.shape[0]
+        pd, ph, pw = self.patch_size
+        D, H, W = self.img_size
+        gd, gh, gw = self.patch_grid
+        
+        x = x.reshape(B, gd, gh, gw, self.in_channels, pd, ph, pw)
+        x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        x = x.reshape(B, self.in_channels, D, H, W)
+        
+        return x
+    
+    def random_masking(self, x, mask_ratio):
+        """
+        Random masking following MAE.
+        x: (B, N, D)
+        Returns:
+            x_masked: (B, N_keep, D)
+            mask: (B, N) binary mask (1 = masked, 0 = keep)
+            ids_restore: (B, N) to restore original order
+        """
+        B, N, D = x.shape
+        len_keep = int(N * (1 - mask_ratio))
+        
+        noise = torch.rand(B, N, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        
+        mask = torch.ones([B, N], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        
+        return x_masked, mask, ids_restore
+    
+    def forward_encoder(self, x, mask_ratio):
+        """
+        Forward through encoder with masking.
+        x: (B, C, D, H, W) or (B, T, C, H, W) - handle both formats
+
+        For Swin3D compatibility, we pass the full input through the encoder,
+        then apply masking to the output features (similar to VideoMAE approach)
+        """
+        # Handle input format
+        if x.dim() == 5 and x.shape[2] == 1:  # (B, T, C, H, W) with C=1
+            x = x.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        elif x.dim() == 5:  # (B, T, C, H, W)
+            x = x.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+
+        B = x.shape[0]
+
+        # Patchify for target
+        x_patches = self.patchify(x)  # (B, N, patch_dim)
+
+        # Forward through encoder (full input)
+        latent = self.encoder.forward_features(x)  # (B, L, encoder_dim)
+
+        # Now apply masking to the latent features
+        # Note: encoder may have downsampled, so latent has fewer tokens than patches
+        # We need to match the masking to the encoder output size
+
+        # Create mask for original patch space
+        _, mask, ids_restore = self.random_masking(x_patches, mask_ratio)
+
+        # For simplicity, we'll keep all encoder outputs and mask during loss computation
+        # This is similar to how some MAE variants work
+
+        return latent, mask, ids_restore, x_patches
+    
+    def forward_decoder(self, latent, ids_restore):
+        """
+        Forward through decoder.
+        latent: (B, L, encoder_dim) - encoder output
+        ids_restore: (B, N) - indices to restore order
+        """
+        B = latent.shape[0]
+        
+        # Project encoder features to decoder dimension
+        x = self.decoder_embed(latent)  # (B, L, decoder_dim)
+        
+        # Expand to full sequence with mask tokens
+        N = self.num_patches
+        L = x.shape[1]
+        
+        # Create mask tokens for missing patches
+        mask_tokens = self.mask_token.repeat(B, N - L, 1)
+        
+        # Concatenate visible + mask tokens
+        x_full = torch.cat([x, mask_tokens], dim=1)  # (B, N, decoder_dim)
+        
+        # Unshuffle
+        x_full = torch.gather(x_full, dim=1, 
+                             index=ids_restore.unsqueeze(-1).repeat(1, 1, x_full.shape[2]))
+        
+        # Add positional embedding
+        x_full = x_full + self.decoder_pos_embed
+        
+        # Apply decoder
+        x_dec = self.decoder(x_full)
+        
+        # Predict patches
+        pred = self.decoder_pred(x_dec)
+        
+        return pred
+    
+    def forward(self, x):
+        """
+        Full forward pass.
+        x: (B, T, C, H, W) or (B, C, D, H, W)
+        """
+        # Encode with masking
+        latent, mask, ids_restore, target = self.forward_encoder(x, self.mask_ratio)
+        
+        # Decode
+        pred = self.forward_decoder(latent, ids_restore)
+        
+        return pred, target, mask
+    
+    def training_step(self, batch, batch_idx):
+        x = batch
+        
+        # Forward pass
+        pred, target, mask = self(x)
+        
+        # Compute loss only on masked patches
+        loss = self.criterion(pred[mask.bool()], target[mask.bool()])
+        
+        self.log('train_loss', loss, prog_bar=True, logger=True, sync_dist=True)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        x = batch
+        
+        # Forward pass
+        pred, target, mask = self(x)
+        
+        # Compute loss only on masked patches
+        loss = self.criterion(pred[mask.bool()], target[mask.bool()])
+        
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        
+        # Save for visualization
+        if batch_idx == 0:
+            # Reconstruct full image
+            pred_img = self.unpatchify(pred)
+            target_img = self.unpatchify(target)
+            
+            # Convert back to (B, T, C, H, W) format
+            if pred_img.shape[1] == 1:
+                pred_img = pred_img.permute(0, 2, 1, 3, 4)
+                target_img = target_img.permute(0, 2, 1, 3, 4)
+            
+            self.val_batch_for_viz = (target_img, pred_img)
+        
+        return loss
+    
+    def on_validation_epoch_end(self):
+        if self.global_rank == 0 and hasattr(self, 'val_batch_for_viz'):
+            target, pred = self.val_batch_for_viz
+            visualize_reconstruction(target, pred, sample_idx=0, num_frames=16, 
+                                   epoch=self.current_epoch)
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.lr,
+            weight_decay=0.05,
+            betas=(0.9, 0.95)
+        )
+        
+        # Cosine scheduler with warmup
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.trainer.max_epochs
+        )
+        
+        scheduler = GradualWarmupScheduler(
+            optimizer,
+            multiplier=1,
+            total_epoch=5,
+            after_scheduler=cosine_scheduler
+        )
+        
+        return [optimizer], [scheduler]
+
+
+def main():
+    # ========== Data Loading ==========
+    print("Loading datasets...")
+    full_train_dataset = TileDataset(
+        CFG.segment_path, 
+        splits=["train", "valid"], 
+        transform=get_transforms('train', CFG)
+    )
+    
+    val_size = int(0.01 * len(full_train_dataset))
+    train_size = len(full_train_dataset) - val_size
+    
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=CFG.train_batch_size, 
+        shuffle=True, 
+        num_workers=CFG.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=CFG.valid_batch_size, 
+        shuffle=False, 
+        num_workers=CFG.num_workers,
+        pin_memory=True
+    )
+    
+    print(f"Train loader length: {len(train_loader)}")
+    print(f"Val loader length: {len(val_loader)}")
+    
+    # ========== Model ==========
+    print("Creating Swin3D MAE model...")
+    # Input: (16, 224, 224)
+    # After patch embed (2,4,4): (8, 56, 56)
+    # Window size must divide evenly: 56 = 7*8, so use (4, 7, 7) or (2, 8, 8)
+    model = Swin3DMAE(
+        img_size=(16, 224, 224),
+        patch_size=(2, 4, 4),
+        in_channels=1,
+        embed_dim=96,           # Tiny config
+        depths=(2, 2, 6, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=(4, 7, 7),  # Fixed: (8,56,56) -> 4 divides 8, 7 divides 56
+        decoder_embed_dim=512,
+        decoder_depth=4,
+        decoder_num_heads=8,
+        mask_ratio=0.75,
+        lr=1e-4
+    )
+    
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    
+    # ========== Training ==========
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="swin3d_mae_{epoch}",
+        save_top_k=-1,
+        every_n_epochs=1
+    )
+    
+    trainer = pl.Trainer(
+        max_epochs=200,
+        accelerator="auto",
+        devices=-1,
+        strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
+        log_every_n_steps=20,
+        check_val_every_n_epoch=1,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
+        callbacks=[checkpoint_callback],
+        precision=16  # Mixed precision training
+    )
+    
+    print("Starting training...")
+    trainer.fit(model, train_loader, val_loader)
+
+
+if __name__ == "__main__":
+    main()
