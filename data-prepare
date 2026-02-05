@@ -19,8 +19,8 @@ class CFG:
     current_dir = '../'
     segment_path = './pretraining_scrolls/'
     
-    start_idx = 15
-    in_chans = 30
+    start_idx = 20
+    in_chans = 20
     
     size = 224
     tile_size = 224
