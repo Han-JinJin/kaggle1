@@ -65,15 +65,15 @@ def parse_args():
     # Image/tile configuration
     parser.add_argument('--size', type=int, default=224,
                         help='Input image size')
-    parser.add_argument('--tile_size', type=int, default=64,
+    parser.add_argument('--tile_size', type=int, default=224,  # FIXED: Match MAE pretraining
                         help='Tile size for processing')
     parser.add_argument('--stride_divisor', type=int, default=4,
                         help='Divisor for stride calculation (stride = tile_size // stride_divisor)')
 
     # Training hyperparameters
-    parser.add_argument('--train_batch_size', type=int, default=50,
+    parser.add_argument('--train_batch_size', type=int, default=32,  # FIXED: Reduced for 224x224 tiles
                         help='Training batch size')
-    parser.add_argument('--valid_batch_size', type=int, default=50,
+    parser.add_argument('--valid_batch_size', type=int, default=32,  # FIXED: Reduced for 224x224 tiles
                         help='Validation batch size')
     parser.add_argument('--lr', type=float, default=5e-5,
                         help='Learning rate')
@@ -96,7 +96,7 @@ def parse_args():
                         help='Fragment identifiers for ratio2 scaling')
     parser.add_argument('--ratio1', type=int, default=2,
                         help='Scaling ratio for frags_ratio1')
-    parser.add_argument('--ratio2', type=int, default=1,
+    parser.add_argument('--ratio2', type=int, default=2,  # FIXED: Match data-prepare and mae-swin
                         help='Scaling ratio for frags_ratio2')
 
     # Augmentation and normalization
@@ -143,12 +143,14 @@ def parse_args():
                         help='Freeze model backbone')
     parser.add_argument('--out_chans', type=int, default=1,
                         help='Number of output channels')
-    parser.add_argument('--scale_factor', type=int, default=8,
+    parser.add_argument('--scale_factor', type=int, default=4,  # FIXED: Match SwinUNet3D 1/4 resolution output
                         help='Scale factor for output')
+    parser.add_argument('--load_encoder_only', action='store_true',  # ADD: Load only encoder from MAE checkpoint
+                        help='Load only encoder weights from checkpoint')
 
     # Checkpoint configuration
     parser.add_argument('--checkpoint_path', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+                        help='Path to MAE pretrained checkpoint or checkpoint to resume from')
     parser.add_argument('--save_top_k', type=int, default=-1,
                         help='Save top k models (-1 for all)')
 
@@ -220,24 +222,16 @@ def get_model(cfg, pred_shape, wandb_logger):
         'lr': cfg.lr,
         'scheduler': cfg.scheduler,
         'wandb_logger': wandb_logger,
-        'freeze': cfg.freeze
+        'freeze': cfg.freeze,
+        'checkpoint_path': cfg.checkpoint_path,      # ADD: Pass checkpoint path
+        'load_encoder_only': cfg.load_encoder_only   # ADD: Pass encoder-only flag
     }
 
     if cfg.model == 'swin':
         model = swin.SwinModel(**model_params)
-    elif cfg.model == 'vmae':
-        model = vmae.VideoMaeModel(**model_params)
-    elif cfg.model == 'timesformer_hug':
-        model = timesformer_hug.TimesfomerModel(**model_params)
-    elif cfg.model == 'resnet':
-        # Import resnet model if available
-        try:
-            import models.resnetall as resnetall
-            model = resnetall.ResNetModel(**model_params)
-        except (ImportError, AttributeError):
-            raise ValueError(f"ResNet model not properly configured. Check models/resnetall.py")
+    # REMOVED: vmae, timesformer_hug, resnet references (not implemented)
     else:
-        raise ValueError(f"Unknown model type: {cfg.model}")
+        raise ValueError(f"Model type '{cfg.model}' not implemented. Only 'swin' is available.")
 
     return model
 
@@ -744,15 +738,13 @@ def train_single_fold(cfg, segments, valid_id):
     # Create model
     model = get_model(cfg, pred_shape, wandb_logger)
 
-    # Load checkpoint if provided
+    # Load checkpoint if provided (already handled in model.__init__)
     if cfg.checkpoint_path:
-        print(f"Loading checkpoint from: {cfg.checkpoint_path}")
-        if cfg.model == 'swin':
-            model = swin.load_weights(model, cfg.checkpoint_path)
-        elif cfg.model == 'vmae':
-            model = vmae.load_weights(model, cfg.checkpoint_path)
-        elif cfg.model == 'timesformer_hug':
-            model = timesformer_hug.load_weights(model, cfg.checkpoint_path)
+        print(f"Checkpoint path provided: {cfg.checkpoint_path}")
+        if cfg.load_encoder_only:
+            print("Will load encoder weights only from MAE checkpoint")
+        # Checkpoint loading is now handled in SwinModel.__init__ via load_pretrained_weights()
+        # No additional loading needed here
 
     # Watch model with W&B
     wandb_logger.watch(model, log="all", log_freq=50, log_graph=False)
