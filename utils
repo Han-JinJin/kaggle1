@@ -1,8 +1,12 @@
+"""
+Utility functions for Vesuvius Ink Detection
+Data loading, augmentation, and helper functions
+"""
+
 import glob
 import os
 import cv2
 from PIL import Image, ImageOps
-import tifffile as tiff
 import numpy as np
 from scipy import ndimage
 from tqdm import tqdm
@@ -11,18 +15,9 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import _LRScheduler
-from torch.optim.lr_scheduler import LinearLR
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.optim import AdamW
-import wandb
-from scipy.ndimage import zoom
-
-
+from scipy.interpolate import CubicSpline
 import traceback
 
-import numpy as np
-from scipy.interpolate import CubicSpline
 
 def create_lut(control_points, bit_depth=8):
     """
@@ -53,6 +48,7 @@ def create_lut(control_points, bit_depth=8):
         raise ValueError("Unsupported bit depth: {}".format(bit_depth))
     return lut
 
+
 def apply_lut_to_stack(img_stack, lut):
     """
     Apply a LUT to a 3D grayscale image stack (H, W, D).
@@ -74,8 +70,25 @@ def apply_lut_to_stack(img_stack, lut):
 
 
 def read_image_mask(fragment_id, CFG=None):
-    """ 
-    Reads a fragment image and its corresponding masks.    
+    """
+    Reads a fragment image and its corresponding masks.
+
+    Args:
+        fragment_id: Fragment identifier
+        CFG: Configuration object with parameters:
+            - segment_path: Path to segment directory
+            - start_idx: Starting layer index
+            - in_chans: Number of input channels
+            - valid_chans: Number of validation channels
+            - valid_id: Validation fragment ID
+            - size: Tile size
+            - frags_ratio1, frags_ratio2: Fragment scaling identifiers
+            - ratio1, ratio2: Scaling ratios
+
+    Returns:
+        images: (H, W, in_chans) numpy array
+        mask: (H, W) float32 array, ink labels normalized to [0, 1]
+        fragment_mask: (H, W) float32 array, fragment mask normalized to [0, 1]
     """
 
     control_points = [(0, 0), (128, 64), (255, 255)]
@@ -83,192 +96,213 @@ def read_image_mask(fragment_id, CFG=None):
     # Create the LUT
     lut = create_lut(control_points, bit_depth=8)
 
-    
     images = []
-    start_idx = CFG.start_idx 
+    start_idx = CFG.start_idx
     end_idx = start_idx + CFG.in_chans
-    
+
     idxs = range(start_idx, end_idx)
     image_shape = 0
-    
-    if fragment_id==CFG.valid_id:
-        print('valid')
-        start_idx = int(start_idx+(CFG.in_chans-CFG.valid_chans)//2)
+
+    # For validation, adjust to use middle valid_chans
+    if fragment_id == CFG.valid_id:
+        print('valid fragment detected, adjusting channels')
+        start_idx = int(start_idx + (CFG.in_chans - CFG.valid_chans) // 2)
         end_idx = start_idx + CFG.valid_chans
         idxs = range(start_idx, end_idx)
-        print(start_idx)
-    
-    try:
+        print(f"Using layers {start_idx}-{end_idx-1} for validation")
 
-        for i in tqdm(idxs):
+    try:
+        for i in tqdm(idxs, desc=f"Loading {fragment_id}"):
             tif_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.tif")
             jpg_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.jpg")
-            png_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.png") 
-            
+            png_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.png")
+
+            # Try to load image from different formats
             if os.path.exists(tif_path):
                 image = cv2.imread(tif_path, 0)
             elif os.path.exists(jpg_path):
                 image = cv2.imread(jpg_path, 0)
             else:
                 image = cv2.imread(png_path, 0)
-            
-            # Resize the image to match the expected size
+
+            # Resize the image based on fragment type
             if (any(sub in fragment_id for sub in CFG.frags_ratio1)):
                 scale = 1 / CFG.ratio1
-                new_w = int(image.shape[1] * scale) 
-                new_h = int(image.shape[0] * scale) 
+                new_w = int(image.shape[1] * scale)
+                new_h = int(image.shape[0] * scale)
                 image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
             elif (any(sub in fragment_id for sub in CFG.frags_ratio2)):
                 scale = 1 / CFG.ratio2
                 new_w = int(image.shape[1] * scale)
                 new_h = int(image.shape[0] * scale)
                 image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                scale = 1 / 1
-                new_w = int(image.shape[1] * scale)
-                new_h = int(image.shape[0] * scale)
-                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
             image_shape = (image.shape[1], image.shape[0])
-                
-            # pad0 = (CFG.size - image.shape[0] % CFG.size) % CFG.size
-            # pad1 = (CFG.size - image.shape[1] % CFG.size) % CFG.size
-            # image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
-           
-            image=np.clip(image,0,200)
+
+            # Clip pixel values to reduce noise
+            image = np.clip(image, 0, 200)
             images.append(image)
 
+        # Stack all channels
         images = np.stack(images, axis=2)
-        # images = apply_lut_to_stack(images, lut)
-        print(f" Shape of {fragment_id} segment: {images.shape}")
-        # if fragment_id == '20231024093300':
-        #     images=images[:,:,::-1]
-        # if fragment_id == CFG.valid_id:
-        #     print('interpolate valid chans')
-        #     # import numpy as np
-        #     # from scipy.ndimage import zoom
+        print(f"Shape of {fragment_id} segment: {images.shape}")
 
-        #     # Suppose images has shape (H, W, D)
-        #     H, W, D = images.shape
+        # Initialize masks
+        mask = np.zeros(images.shape[:2], dtype=np.uint8)  # (H, W)
+        fragment_mask = np.zeros(images.shape[:2], dtype=np.uint8)  # (H, W)
 
-        #     # Compute zoom factors
-        #     zoom_factors = (1, 1, 16 / D)
-
-        #     # Interpolate along depth (third axis)
-        #     images = zoom(images, zoom_factors, order=1)  # order=1 → linear interpolation
-
-        mask = np.zeros(images.shape[:2], dtype=np.uint8)  # shape = (H, W)
-        fragment_mask = np.zeros(images.shape[:2], dtype=np.uint8)  # shape = (H, W)
-        # # READ INK LABELS
+        # READ INK LABELS
         inklabel_files = glob.glob(f"{CFG.segment_path}/{fragment_id}/*inklabels.*")
-        
+
         if len(inklabel_files) > 0:
             mask = cv2.imread(inklabel_files[0], 0)
         else:
-            # print(f"Creating empty mask for {fragment_id}")
-            # mask = np.zeros(images.shape[:2])
-        
+            # Create empty mask if no inklabels file exists
+            print(f"No inklabels found for {fragment_id}, creating empty mask")
             mask = np.zeros(images.shape[:2], dtype=np.uint8)
 
-            # # Build save path (same folder as images)
+            # Save empty mask
             save_dir = f"{CFG.segment_path}/{fragment_id}"
-
+            os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f"{fragment_id}_inklabels.png")
-
-            # Save mask
             cv2.imwrite(save_path, mask)
             print(f"Saved empty mask to: {save_path}")
 
-            
-        mask =  cv2.resize(mask , image_shape, interpolation=cv2.INTER_AREA)
-    
+        # Resize mask to match image size
+        mask = cv2.resize(mask, image_shape, interpolation=cv2.INTER_AREA)
+
+        # Read fragment mask
         path = f"{CFG.segment_path}{fragment_id}/{fragment_id}_mask.png"
-        fragment_mask = cv2.imread(path,0)
-            
+        if os.path.exists(path):
+            fragment_mask = cv2.imread(path, 0)
+            fragment_mask = cv2.resize(fragment_mask, image_shape, interpolation=cv2.INTER_AREA)
+        else:
+            print(f"Warning: Fragment mask not found at {path}")
+            fragment_mask = np.ones(image_shape, dtype=np.uint8) * 255
 
-        fragment_mask =  cv2.resize(fragment_mask , image_shape, interpolation=cv2.INTER_AREA)
-        # pad0 = (CFG.size - fragment_mask.shape[0] % CFG.size) % CFG.size
-        # pad1 = (CFG.size - fragment_mask.shape[1] % CFG.size) % CFG.size
-        # fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
+        # Normalize masks to [0, 1]
+        mask = mask.astype('float32') / 255.0
+        fragment_mask = fragment_mask.astype('float32') / 255.0
 
-        # mask = np.pad(mask, [(0, pad0), (0, pad1)], constant_values=0)
-        
-        
-        mask = mask.astype('float32')
-        mask/=255
-        fragment_mask = fragment_mask.astype('float32')/255
-        
-            
     except Exception as e:
         print(f"Error processing fragment {fragment_id}: {e}")
         traceback.print_exc()
+        return None, None, None
 
-            
     return images, mask, fragment_mask
 
+
 def get_train_valid_dataset(CFG=None):
+    """
+    Extract training and validation tiles from fragments.
+
+    Returns:
+        train_images: list of (size, size, in_chans) tiles
+        train_masks: list of (size, size, 1) masks
+        valid_images: list of (size, size, valid_chans) tiles
+        valid_masks: list of (size, size, 1) masks
+        valid_xyxys: list of [x1, y1, x2, y2] coordinates for validation
+    """
     train_images = []
     train_masks = []
-    
+
     valid_images = []
     valid_masks = []
     valid_xyxys = []
-    
-    segments = CFG.segments  # List of segment IDs (subdirectory names or file prefixes)
-    path = CFG.segment_path  # Path to the directory containing all segments
-    
+
+    segments = CFG.segments
+    path = CFG.segment_path
+
     for fragment_id in segments:
         fragment_path = os.path.join(path, fragment_id)
 
         if not os.path.isdir(fragment_path):
-            continue  # Skip
+            print(f"Warning: Fragment directory not found: {fragment_path}")
+            continue
 
-        print('reading', fragment_id)
+        print(f'Reading fragment: {fragment_id}')
 
         image, mask, fragment_mask = read_image_mask(fragment_id, CFG=CFG)
 
+        if image is None or mask is None or fragment_mask is None:
+            print(f"Skipping {fragment_id} due to loading error")
+            continue
+
+        # Calculate tile positions
         x1_list = list(range(0, image.shape[1] - CFG.tile_size + 1, CFG.stride))
         y1_list = list(range(0, image.shape[0] - CFG.tile_size + 1, CFG.stride))
+
+        print(f"Extracting tiles from {len(x1_list) * len(y1_list)} windows...")
+
         windows_dict = {}
 
         for a in y1_list:
             for b in x1_list:
+                # Check if tile has sufficient fragment coverage
                 if np.mean(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size]) >= 1:
-                                    
+
+                    # For validation, ensure some ink labels exist
                     if fragment_id == CFG.valid_id or not np.all(mask[a:a + CFG.tile_size, b:b + CFG.tile_size] < 0.05):
+
+                        # Extract size x size tiles within tile_size window
                         for yi in range(0, CFG.tile_size, CFG.size):
                             for xi in range(0, CFG.tile_size, CFG.size):
                                 y1 = a + yi
                                 x1 = b + xi
                                 y2 = y1 + CFG.size
                                 x2 = x1 + CFG.size
-                                if fragment_id != CFG.valid_id :
-                                    if (y1, y2, x1, x2) not in windows_dict:
-                                        train_images.append(image[y1:y2, x1:x2])
-                                        train_masks.append(mask[y1:y2, x1:x2, None])
-                                        assert image[y1:y2, x1:x2].shape == (CFG.size, CFG.size, CFG.in_chans)
-                                        windows_dict[(y1, y2, x1, x2)] = '1'
+
+                                # Avoid duplicate tiles
+                                if (y1, y2, x1, x2) in windows_dict:
+                                    continue
+                                windows_dict[(y1, y2, x1, x2)] = '1'
+
+                                if fragment_id != CFG.valid_id:
+                                    # Training tile
+                                    train_images.append(image[y1:y2, x1:x2])
+                                    train_masks.append(mask[y1:y2, x1:x2, None])
+                                    assert image[y1:y2, x1:x2].shape == (CFG.size, CFG.size, CFG.in_chans), \
+                                        f"Unexpected shape: {image[y1:y2, x1:x2].shape}"
                                 else:
-                                    if (y1, y2, x1, x2) not in windows_dict:
-                                        valid_images.append(image[y1:y2, x1:x2])
-                                        valid_masks.append(mask[y1:y2, x1:x2, None])
-                                        valid_xyxys.append([x1, y1, x2, y2])
-                                        assert image[y1:y2, x1:x2].shape==(CFG.size,CFG.size,CFG.valid_chans)
-                                        windows_dict[(y1, y2, x1, x2)] = '1'
+                                    # Validation tile
+                                    valid_images.append(image[y1:y2, x1:x2])
+                                    valid_masks.append(mask[y1:y2, x1:x2, None])
+                                    valid_xyxys.append([x1, y1, x2, y2])
+                                    assert image[y1:y2, x1:x2].shape == (CFG.size, CFG.size, CFG.valid_chans), \
+                                        f"Unexpected shape: {image[y1:y2, x1:x2].shape}"
+
+        print(f"Extracted {len([x for x in windows_dict if (x[0] + x[1]) % CFG.size == 0])} unique tiles")
+
+    print(f"\nTotal train images: {len(train_images)}")
+    print(f"Total valid images: {len(valid_images)}")
 
     return train_images, train_masks, valid_images, valid_masks, valid_xyxys
 
 
+# ============================================================================
+# Video Dataset
+# ============================================================================
 
-import numpy as np
-import random
 import torch
 from torch.utils.data import Dataset
-import torch.nn.functional as F
 import torchvision.transforms as T
-import albumentations as A
 
 
 class VideoDataset(Dataset):
+    """
+    Video dataset for 3D volumetric data.
+
+    Args:
+        images: list of numpy arrays with shape (H, W, C)
+        cfg: configuration object
+        xyxys: list of [x1, y1, x2, y2] for validation (optional)
+        labels: list of masks (optional)
+        transform: albumentations transform
+        norm: whether to normalize
+        aug: augmentation type ('fourth', 'shuffle', or None)
+        out_chans: number of output channels
+        scale_factor: downscale factor for mask
+    """
 
     def __init__(
         self,
@@ -280,21 +314,8 @@ class VideoDataset(Dataset):
         norm=True,
         aug=None,
         out_chans=1,
-        scale_factor=8
+        scale_factor=4  # FIXED: Changed from 8 to 4 to match SwinUNet3D output (1/4 resolution)
     ):
-        """
-        images: tensor [N, C, H, W]  OR  list of images
-        cfg: cfg object with fields:
-            - size
-            - in_chans
-            - valid_chans
-            - out_chans (number of output video channels)
-        xyxys: used for validation
-        labels: masks
-        transform: Albumentations transform
-        norm: if True → use 3D normalization
-        aug: augmentation choice: 'fourth', 'shuffle', None
-        """
         self.images = images
         self.cfg = cfg
         self.labels = labels
@@ -302,8 +323,8 @@ class VideoDataset(Dataset):
         self.xyxys = xyxys
         self.aug = aug
         self.out_chans = out_chans
-
         self.scale_factor = scale_factor
+
         # ---------------------- #
         #   MAIN VIDEO TRANSFORM
         # ---------------------- #
@@ -316,12 +337,10 @@ class VideoDataset(Dataset):
                 # Standard RGB ImageNet normalization
                 mean = [0.485, 0.456, 0.406]
                 std  = [0.229, 0.224, 0.225]
-
             elif out_ch == 1:
                 # Grayscale normalization
                 mean = [0.5]
                 std  = [0.5]
-
             else:
                 # Generic N-channel normalization
                 mean = [0.5] * out_ch
@@ -339,24 +358,29 @@ class VideoDataset(Dataset):
     # ------------------------------------------------------------ #
     def fourth_augment(self, image):
         """
-        Randomly crop K contiguous channels and zero out random others.
+        Randomly crop K contiguous channels from in_chans channels.
+        This simulates the MAE pretraining augmentation.
         """
         C = self.cfg.in_chans
         K = self.cfg.valid_chans
 
-        # pick contiguous crop
+        # Edge case: if C == K, no cropping needed
+        if C == K:
+            return image
+
+        # Pick contiguous crop
         start_idx = random.randint(0, C - K)
         crop_idx = np.arange(start_idx, start_idx + K)
         cropped = image[..., crop_idx].copy()
 
-        # randomly zero out some channels inside the cropped block
-        zero_mask = np.random.rand(K) < 0.03 # 5% chance per channel
+        # Randomly zero out some channels (3% probability)
+        zero_mask = np.random.rand(K) < 0.03
         cropped[..., zero_mask] = 0
 
         return cropped
 
     def shuffle_channels(self, image):
-        """Random channel shuffle, returns exactly valid_chans."""
+        """Random channel shuffle."""
         K = self.cfg.valid_chans
         perm = np.random.permutation(K)
         return image[..., perm]
@@ -366,9 +390,10 @@ class VideoDataset(Dataset):
     # ------------------------------------------------------------ #
 
     def apply_aug(self, image):
-        # if self.aug == "fourth":
-        image = self.fourth_augment(image)
-        if self.aug == "shuffle":
+        """Apply selected augmentation."""
+        if self.aug == "fourth":
+            image = self.fourth_augment(image)
+        elif self.aug == "shuffle":
             image = self.shuffle_channels(image)
         return image
 
@@ -377,7 +402,6 @@ class VideoDataset(Dataset):
     # ------------------------------------------------------------ #
 
     def __getitem__(self, idx):
-
         image = self.images[idx]
         label = self.labels[idx] if self.labels is not None else None
 
@@ -389,61 +413,78 @@ class VideoDataset(Dataset):
                 data = self.transform(image=image, mask=label)
                 image = data["image"].unsqueeze(0)
                 label = data["mask"]
+
+                # Downsample label to match model output (1/4 resolution)
                 label = F.interpolate(
                     label.unsqueeze(0),
-                    (self.cfg.size // self.scale_factor,
-                     self.cfg.size // self.scale_factor)
+                    (self.cfg.size // self.scale_factor, self.cfg.size // self.scale_factor)
                 ).squeeze(0)
 
-            # permute to [frames, C, H, W]
-            image = image.permute(1, 0, 2, 3)
+            # Permute to [frames, C, H, W]
+            image = image.permute(1, 0, 2, 3)  # (T, 1, H, W)
 
-            # convert frames
-            image = torch.stack([self.video_transform(f) for f in image])
+            # Convert and normalize frames
+            image = torch.stack([self.video_transform(f) for f in image])  # (T, 1, H, W)
 
-            # repeat channels if needed
+            # Repeat channels if needed
             if image.shape[1] != self.out_chans:
                 image = image.repeat(1, self.out_chans, 1, 1)
+
+            # CRITICAL FIX: Permute from (T, 1, H, W) to (1, T, H, W) for Swin3D
+            # After DataLoader: (B, 1, T, H, W) which matches Swin3D input format
+            image = image.permute(1, 0, 2, 3)  # (1, T, H, W)
 
             return image, label, xy
 
         # TRAIN CASE
         else:
-            # apply augmentation
+            # Apply augmentation
             image = self.apply_aug(image)
 
-            # apply albumentations
+            # Apply albumentations
             if self.transform:
                 data = self.transform(image=image, mask=label)
                 image = data["image"].unsqueeze(0)
                 label = data["mask"]
+
+                # Downsample label
                 label = F.interpolate(
                     label.unsqueeze(0),
-                    (self.cfg.size // self.scale_factor,
-                     self.cfg.size // self.scale_factor)
+                    (self.cfg.size // self.scale_factor, self.cfg.size // self.scale_factor)
                 ).squeeze(0)
 
-            # permute → video frames
-            image = image.permute(1, 0, 2, 3)
+            # Permute to video frames
+            image = image.permute(1, 0, 2, 3)  # (T, 1, H, W)
 
-            # apply transforms frame-wise
-            image = torch.stack([self.video_transform(f) for f in image])
+            # Apply transforms frame-wise
+            image = torch.stack([self.video_transform(f) for f in image])  # (T, 1, H, W)
 
-            # repeat channels
+            # Repeat channels if needed (though out_chans=1 usually)
             if image.shape[1] != self.out_chans:
                 image = image.repeat(1, self.out_chans, 1, 1)
+
+            # CRITICAL FIX: Permute from (T, 1, H, W) to (1, T, H, W) for Swin3D
+            # After DataLoader: (B, 1, T, H, W) which matches Swin3D input format
+            image = image.permute(1, 0, 2, 3)  # (1, T, H, W)
 
             return image, label
 
 
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
 def get_transforms(data, cfg):
+    """Get data transforms based on split type."""
     if data == 'train':
         aug = A.Compose(cfg.train_aug_list)
     elif data == 'valid':
         aug = A.Compose(cfg.valid_aug_list)
     return aug
-    
+
+
 def set_seed(seed=None, cudnn_deterministic=True):
+    """Set random seed for reproducibility."""
     if seed is None:
         seed = 42
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -453,12 +494,16 @@ def set_seed(seed=None, cudnn_deterministic=True):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = cudnn_deterministic
     torch.backends.cudnn.benchmark = False
-    
+
+
 def make_dirs(cfg):
+    """Create necessary directories."""
     for dir in [cfg.model_dir]:
         os.makedirs(dir, exist_ok=True)
-        
+
+
 def cfg_init(cfg, mode='train'):
+    """Initialize configuration."""
     set_seed(cfg.seed)
     if mode == 'train':
         make_dirs(cfg)
