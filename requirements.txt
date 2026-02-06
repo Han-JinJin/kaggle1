@@ -1,0 +1,13 @@
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.0.0
+segmentation-models-pytorch
+albumentations
+opencv-python
+numpy
+scipy
+pillow
+tqdm
+warmup-scheduler
+wandb
+matplotlib
