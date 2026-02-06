@@ -1,973 +1,570 @@
+"""
+Adapted MAE Training Script using Custom Swin3D from Scratch
+Integrates with existing data pipeline and PyTorch Lightning
+"""
+
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-
-from torch.utils.data import DataLoader, Dataset
-# from transformers import AutoImageProcessor
-import torchvision.transforms as T
 import numpy as np
-import random
+import torch.distributed as dist
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-
-import segmentation_models_pytorch as smp
-
-from torch.optim import AdamW
 from warmup_scheduler import GradualWarmupScheduler
 
-import utils
-
-from torchvision.models.video import swin_transformer
-#  torchvision.models.swin_transformer.SwinTransformer 
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, random_split
 import albumentations as A
-# from transformers import VideoMAEConfig, VideoMAEForPreTraining
-# from transformers import VideoMAEModel
+from albumentations.pytorch import ToTensorV2
+import torchvision.transforms as T
+import random
+import cv2
+from tqdm.auto import tqdm
+
+# Import our custom Swin3D components
+import sys
+sys.path.append('./')
+from swin3d_transformer import (
+    SwinTransformer3D,
+    PatchEmbedding3D,
+    BasicLayer3D,
+    PatchMerging3D,
+)
+
+PIL_Image_MAX_IMAGE_PIXELS = 933120000
 
 
+class CFG:
+    # ============== comp exp name =============
+    current_dir = '../'
+    segment_path = './pretraining_scrolls/'
+    
+    start_idx = 20
+    in_chans = 20
+    valid_chans = 16  # chans used 
+    
+    size = 224
+    tile_size = 224
+    stride = tile_size // 1
+    
+    train_batch_size = 10
+    valid_batch_size = 5
+    lr = 1e-4
+    
+    # ============== model cfg =============
+    scheduler = 'cosine'
+    epochs = 16
+    warmup_factor = 10
+    
+    # Change the size of fragments
+    frags_ratio1 = ['frag', 're']
+    frags_ratio2 = ['202', 's4', 'left']
+    ratio1 = 2
+    ratio2 = 1
+    
+    # ============== valid =============
+    segments = ['20240304141531'] 
+    valid_id = '20240304141531'
+    
+    # ============== fixed =============
+    min_lr = 1e-7
+    weight_decay = 1e-6
+    max_grad_norm = 100
+    num_workers = 16
+    seed = 0
+        
+    # ============== augmentation =============
+    train_aug_list = [
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.ShiftScaleRotate(rotate_limit=360, shift_limit=0.15, p=0.75),
+        ToTensorV2(transpose_mask=True),
+    ]
 
-class TimesformerDataset(Dataset):
-    def __init__(self, images, cfg, xyxys=None, labels=None, transform=None, norm=False, aug=None):
-        self.images = images
-        self.cfg = cfg
-        self.labels = labels
+    valid_aug_list = [
+        ToTensorV2(transpose_mask=True),  
+    ]
+    
+
+def get_transforms(data, cfg):
+    if data == 'train':
+        aug = A.Compose(cfg.train_aug_list)
+    elif data == 'valid':
+        aug = A.Compose(cfg.valid_aug_list)
+    return aug
+
+
+class TileDataset(Dataset):
+    def __init__(self, base_path, splits=["train"], transform=None):
+        self.tile_paths = []
+        for split in splits:
+            split_path = os.path.join(base_path, "224_tiles", split)
+            self.tile_paths += [
+                os.path.join(split_path, f) 
+                for f in os.listdir(split_path) if f.endswith(".npy")
+            ]
+
         self.transform = transform
-        self.rotate = A.Compose([A.Rotate(8,p=1)])
-        self.xyxys=xyxys
-        self.aug = aug
-        self.scale_factor = 16
-        
         self.video_transform = T.Compose([
-            T.ConvertImageDtype(torch.float32),  # scales to [0.0, 1.0]
-        ])
-        
-        # Conditionally add Normalize transformation
-        if norm:
-            self.video_transform = T.Compose([
             T.ConvertImageDtype(torch.float32), 
-            # T.Normalize(mean=[0.485, 0.456, 0.406],
-            # std=[0.229, 0.224, 0.225]),
             T.Normalize(mean=[0.5], std=[0.5])
-            ])
-                
+        ])
+
     def __len__(self):
-        return len(self.images)
+        return len(self.tile_paths)
     
-    # def fourth_augment(self, image):
-    #     """
-    #     Custom channel augmentation that returns exactly 24 channels.
-    #     """
-    #     # always select 8
-    #     cropping_num =  self.cfg.valid_chans 
-
-    #     # pick crop indices
-    #     start_idx = random.randint(0, self.cfg.in_chans - cropping_num)
-    #     crop_indices = np.arange(start_idx, start_idx + cropping_num)
-
-    #     # pick where to paste them
-    #     start_paste_idx = random.randint(0, self.cfg.in_chans - cropping_num)
-
-    #     # container
-    #     image_tmp = np.zeros_like(image)
-
-    #     # paste cropped channels
-    #     image_tmp[..., start_paste_idx:start_paste_idx + cropping_num] = image[..., crop_indices]
-
-    #     # # optional random cutout
-    #     # cutout_idx = random.randint(0, 1)
-    #     # temporal_random_cutout_idx = np.arange(start_paste_idx, start_paste_idx + cutout_idx)
-    #     # if random.random() > 0.4:
-    #     #     image_tmp[..., temporal_random_cutout_idx] = 0
-
-    #     # finally, keep only 24 channels
-    #     image = image_tmp[..., start_paste_idx:start_paste_idx + cropping_num]
-
-    #     return image
     def fourth_augment(self, image):
-        """
-        Custom channel augmentation that returns exactly 24 channels.
-        """
-        # always select 24 channels
-        remove_n = 0
-        cropping_num = self.cfg.valid_chans  + remove_n
-
-        # pick crop indices
-        start_idx = random.randint(0, self.cfg.in_chans - cropping_num)
+        cropping_num = CFG.valid_chans  # Number of channels to crop
+        start_idx = random.randint(0, CFG.in_chans - cropping_num)
         crop_indices = np.arange(start_idx, start_idx + cropping_num)
-
-        # pick where to paste them
-        start_paste_idx = random.randint(0, self.cfg.in_chans - cropping_num)
-        
-        # container
-        image_tmp = np.zeros_like(image)
-        image_tmp[..., start_paste_idx:start_paste_idx + cropping_num] = image[..., crop_indices]
-        
-        # --- remove 2 random channels (instead of blacking out) ---
-        all_indices = np.arange(start_paste_idx, start_paste_idx + cropping_num)
-        remove_idx = np.random.choice(all_indices, remove_n, replace=False)
-        # keep all except removed ones
-        keep_idx = np.array([i for i in all_indices if i not in remove_idx])
-        image_tmp = image_tmp[..., keep_idx]
-
-        return image_tmp
-    
-    def shuffle(self, image):
-        """
-        Channel shuffle augmentation that returns exactly 24 channels.
-        """
-        # Shuffle channels randomly
-        shuffled_indices = np.random.permutation(self.cfg.valid_chans)
-        image_shuffled = image[..., shuffled_indices]
-
-        return image_shuffled
-
+        return image[..., crop_indices]
 
     def __getitem__(self, idx):
-        if self.xyxys is not None: #VALID
-            image = self.images[idx]
-            label = self.labels[idx]
-            xy=self.xyxys[idx]
-            
-            if self.transform:
-                data = self.transform(image=image, mask=label)
-                image = data['image'].unsqueeze(0)
-                label = data['mask']
-                label=F.interpolate(label.unsqueeze(0),(self.cfg.size//self.scale_factor,self.cfg.size//self.scale_factor)).squeeze(0)
-                
-            image = image.permute(1,0,2,3)
-            # image = image.repeat(1,3,1,1)
-            image = torch.stack([self.video_transform(f) for f in image]) # list of frames
-            return image, label,xy
-            
-        else:
-            image = self.images[idx]
-            label = self.labels[idx]
+        image = np.load(self.tile_paths[idx])  # H x W x C
+        image = self.fourth_augment(image)          
+        if self.transform:
+            data = self.transform(image=image)
+            image = data['image'].unsqueeze(0)
+        image = image.permute(1, 0, 2, 3)
+        image = torch.stack([self.video_transform(f) for f in image])
+        return image
 
-            if self.aug == 'fourth':
-                image=self.fourth_augment(image)
-                # image = self.shuffle(image)
-            
-            if self.transform:
-                data = self.transform(image=image, mask=label)
-                image = data['image'].unsqueeze(0)
-                label = data['mask']
-                label=F.interpolate(label.unsqueeze(0),(self.cfg.size//self.scale_factor,self.cfg.size//self.scale_factor)).squeeze(0)
 
-            image = image.permute(1,0,2,3)
-            
-            image = torch.stack([self.video_transform(f) for f in image]) # list of frames
-            return image, label
+def visualize_reconstruction(original, reconstructed, sample_idx=0, num_frames=16, 
+                            save_path='./results/reconstruction.png', epoch=0):
+    """Visualize original and reconstructed video frames side by side."""
+    orig = original[sample_idx]     # (T, C, H, W)
+    recon = reconstructed[sample_idx]  # (T, C, H, W)
 
-class Patch3DTransformerSegmentation(nn.Module):
-    def __init__(self, num_classes=1, embed_dim=768, num_heads=8, depth=2, patch_output=4):
+    # If grayscale, squeeze channel dim
+    if orig.shape[1] == 1:
+        orig = orig.squeeze(1)
+        recon = recon.squeeze(1)
+
+    # Clamp and convert to numpy
+    orig = orig.cpu().numpy()
+    recon = recon.cpu().detach().numpy()
+
+    fig, axes = plt.subplots(2, num_frames, figsize=(3 * num_frames, 6))
+
+    for i in range(num_frames):
+        # Original frame
+        ax = axes[0, i]
+        ax.imshow(orig[i], cmap='gray')
+        ax.set_title(f"Original Frame {i}")
+        ax.axis('off')
+
+        # Reconstructed frame
+        ax = axes[1, i]
+        ax.imshow(recon[i], cmap='gray')
+        ax.set_title(f"Reconstructed Frame {i}")
+        ax.axis('off')
+
+    os.makedirs(os.path.dirname(f'./results/reconstruction_swin3d_{epoch}.png'), exist_ok=True)
+    plt.savefig(f'./results/reconstruction_swin3d_{epoch}.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+class Swin3DMAE(pl.LightningModule):
+    """
+    3D Video MAE using custom Swin3D Transformer built from scratch
+    """
+    
+    def __init__(self, 
+                 img_size=(16, 64, 64),
+                 patch_size=(2, 4, 4),
+                 in_channels=1,
+                 embed_dim=96,
+                 depths=(2, 2, 6, 2),
+                 num_heads=(3, 6, 12, 24),
+                 window_size=(8, 7, 7),
+                 decoder_embed_dim=512,
+                 decoder_depth=4,
+                 decoder_num_heads=8,
+                 mask_ratio=0.75,
+                 lr=1e-4):
         super().__init__()
-        self.patch_output = patch_output
-        self.num_classes = num_classes
-
-        backbone = swin_transformer.swin3d_t(weights='KINETICS400_V1')
-
-        # Modify first conv layer to accept 1 channel instead of 3
-        old_proj = backbone.patch_embed.proj
-        new_proj = nn.Conv3d(
-            in_channels=1,
-            out_channels=old_proj.out_channels,
-            kernel_size=old_proj.kernel_size,
-            stride=old_proj.stride,
-            padding=old_proj.padding,
-            bias=old_proj.bias is not None
-        )
-        # Initialize weights by summing across RGB channels
-        with torch.no_grad():
-            # old_proj.weight shape: [out_channels, 3, kT, kH, kW]
-            summed = old_proj.weight.sum(dim=1, keepdim=True)   # -> [out_channels, 1, kT, kH, kW]
-            new_proj.weight.copy_(summed)
-
-            # If bias exists, copy it too
-            if old_proj.bias is not None:
-                new_proj.bias.copy_(old_proj.bias)
-
-        # Replace the old conv with the new one
-        backbone.patch_embed.proj = new_proj
-        
-        backbone = nn.Sequential(*list(backbone.children())[:-2]) 
-        
-        ckpt_path = "pretraining/checkpoints/tiny_epoch=72.ckpt"
-        ckpt = torch.load(ckpt_path, map_location='cpu',weights_only=False)  # CPU first, move to GPU later if needed
-
-        # if 'state_dict' in ckpt:
-        #     state_dict = ckpt['state_dict']
-        # else:
-        #     state_dict = ckpt
-        # # Filter only encoder weights (keys start with 'encoder.')
-        # encoder_state_dict = {}
-        # for k, v in state_dict.items():
-        #     if k.startswith('encoder.'):
-        #         # remove 'encoder.' prefix to match backbone keys
-        #         encoder_state_dict[k.replace('encoder.', '')] = v
-
-        # missing, unexpected =  backbone.load_state_dict(encoder_state_dict, strict=False)
-        # print("Missing keys:", missing)
-        # print("Unexpected keys:", unexpected)
-        self.backbone = backbone
-        # # Freeze the backbone
-        # for param in self.backbone.parameters():
-        #     param.requires_grad = False
-        
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim,
-            dropout=0.2,
-            activation="gelu",
-            batch_first=True 
-        )
-        self.embed_dim = embed_dim
-
-        self.decoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(embed_dim, (patch_output ** 2))
-        )
-
-    def forward(self, x):
-        B, C, T, H, W = x.shape
-        # print(x.shape)
-        feats = self.backbone(x)  # (B, T', H', W',embed_dim)
-
-        # Temporal pooling
-        feats = feats.max(dim=1)[0]# (B, 1, Hf, Wf, embed_dim,)
-        
-        B, Hf, Wf, D = feats.shape
-
-        # Move embed_dim to dim 1 and flatten patches
-        patch_tokens = feats.permute(0, 3, 1, 2).contiguous()  # (B, 768, 8, 7, 7)
-        patch_tokens = patch_tokens.view(B, Hf*Wf, -1)        # (B, 768, 8*7*7=392)
-       
-        # print(patch_tokens.shape)
-        transformed_tokens = self.decoder(patch_tokens) 
-        logits = self.classifier(transformed_tokens)
-        logits = logits.permute(0, 2, 1).view(B, self.patch_output**2, Hf, Wf)  # (B, patch_output^2, Hf, Wf)
-        
-        # logits = self.head(transformed_tokens)   # (B, num_classes, Hf, Wf)
-        logits = F.pixel_shuffle(logits, upscale_factor=self.patch_output) 
-        return logits
-    
-class SwinModel(pl.LightningModule):
-    def __init__(self, pred_shape, size, lr, scheduler=None, wandb_logger=None, freeze=False):
-        super(SwinModel, self).__init__()
-
         self.save_hyperparameters()
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        self.IGNORE_INDEX = 127
-
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary',smooth=0.15,ignore_index=self.IGNORE_INDEX)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25,ignore_index=self.IGNORE_INDEX)
-
-        self.loss_func= lambda x,y: 0.5 * self.loss_func1(x,y) +0.5*self.loss_func2(x,y)
-        self.backbone = Patch3DTransformerSegmentation(num_classes=1, patch_output=4)
+        
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.mask_ratio = mask_ratio
+        self.in_channels = in_channels
+        
+        # Calculate patch grid
+        self.patch_grid = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+            img_size[2] // patch_size[2]
+        )
+        self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
+        print(f"Patch grid: {self.patch_grid}, Total patches: {self.num_patches}")
+        
+        # ========== ENCODER: Swin3D Transformer ==========
+        self.encoder = SwinTransformer3D(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            num_classes=0,  # No classification head
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+        )
+        
+        # Get encoder output dimension (after all stages)
+        self.encoder_dim = int(embed_dim * 2 ** (len(depths) - 1))
+        
+        # Calculate encoder output resolution
+        self.encoder_output_resolution = (
+            self.patch_grid[0] // (2 ** (len(depths) - 1)),
+            self.patch_grid[1] // (2 ** (len(depths) - 1)),
+            self.patch_grid[2] // (2 ** (len(depths) - 1))
+        )
+        self.encoder_output_patches = (
+            self.encoder_output_resolution[0] * 
+            self.encoder_output_resolution[1] * 
+            self.encoder_output_resolution[2]
+        )
+        print(f"Encoder output resolution: {self.encoder_output_resolution}")
+        print(f"Encoder output patches: {self.encoder_output_patches}")
+        
+        # ========== DECODER ==========
+        self.decoder_embed = nn.Linear(self.encoder_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        
+        # Positional embedding for full sequence
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches, decoder_embed_dim)
+        )
+        
+        # Transformer decoder
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=decoder_embed_dim,
+            nhead=decoder_num_heads,
+            dim_feedforward=decoder_embed_dim * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
+        
+        # Prediction head
+        patch_dim = patch_size[0] * patch_size[1] * patch_size[2] * in_channels
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_dim)
+        
+        # Loss
+        self.criterion = nn.MSELoss()
+        
+        # Initialize weights
+        self._init_weights()
     
-    def forward(self, x):
-
-        x = x.permute(0,2,1,3,4)
-        output = self.backbone(x)  # runs backbone, sets self.feature
-        return output
-class SwinModel(pl.LightningModule):
-    def __init__(self, pred_shape, size, lr, scheduler=None, wandb_logger=None, freeze=False):
-        super(SwinModel, self).__init__()
-
-        self.save_hyperparameters()
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        self.IGNORE_INDEX = 127
-
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary',ignore_index=self.IGNORE_INDEX)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25,ignore_index=self.IGNORE_INDEX)
-
-        self.loss_func= lambda x,y: 0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
-
-        backbone = swin_transformer.swin3d_t(weights='KINETICS400_V1')
-
-
-        # Modify first conv layer to accept 1 channel instead of 3
-        old_proj = backbone.patch_embed.proj
-        new_proj = nn.Conv3d(
-            in_channels=1,
-            out_channels=old_proj.out_channels,
-            kernel_size=old_proj.kernel_size,
-            stride=old_proj.stride,
-            padding=old_proj.padding,
-            bias=old_proj.bias is not None
-        )
-        # Initialize weights by summing across RGB channels
-        with torch.no_grad():
-            # old_proj.weight shape: [out_channels, 3, kT, kH, kW]
-            summed = old_proj.weight.sum(dim=1, keepdim=True)  # -> [out_channels, 1, kT, kH, kW]
-            new_proj.weight.copy_(summed)
-
-            # If bias exists, copy it too
-            if old_proj.bias is not None:
-                new_proj.bias.copy_(old_proj.bias)
-            # embed_dim = out.shape[1]  # channel dimension
-
-
-        # Replace the old conv with the new one
-        backbone.patch_embed.proj = new_proj
-        embed_dim = 768
-        self.backbone = backbone
-        self.backbone.head = nn.Identity()
-
-
-        self.classifier = nn.Sequential(
-                nn.Linear(embed_dim,(self.hparams.size//32)**2),
-        )
+    def _init_weights(self):
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.decoder_pos_embed, std=0.02)
+        nn.init.normal_(self.decoder_pred.weight, std=0.02)
+        nn.init.constant_(self.decoder_pred.bias, 0)
     
-    def forward(self, x):
-
-        x = x.permute(0,2,1,3,4)
-        preds = self.backbone(x)  # runs backbone, sets self.feature
-        preds = self.classifier(preds)
-        preds = preds.view(-1,1,self.hparams.size//32,self.hparams.size//32)
-        return preds
-class SwinModel(pl.LightningModule):
-    def __init__(self, pred_shape, size, lr, scheduler=None, wandb_logger=None, freeze=False):
-        super(SwinModel, self).__init__()
-
-        self.save_hyperparameters()
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        self.IGNORE_INDEX = 127
-
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary',ignore_index=self.IGNORE_INDEX)
-        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25,ignore_index=self.IGNORE_INDEX)
-
-        self.loss_func= lambda x,y: 0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
-
-        backbone = swin_transformer.swin3d_t(weights=None)#(weights="KINETICS400_V1")
-
-        embed_dim = backbone.norm.normalized_shape[0]  # usually 1024 for swin3d_b
-
-        # Modify first conv layer to accept 1 channel instead of 3
-        old_proj = backbone.patch_embed.proj
-        backbone.patch_embed.proj = nn.Conv3d(
-            in_channels=1,
-            out_channels=old_proj.out_channels,
-            kernel_size=old_proj.kernel_size,
-            stride=old_proj.stride,
-            padding=old_proj.padding,
-            bias=old_proj.bias is not None
-        )
-   def forward(self, x):
-
-        x = x.permute(0,2,1,3,4)
-        preds = self.backbone(x)  # runs backbone, sets self.feature
-        preds = self.classifier(preds)
-        preds = preds.view(-1,1,self.hparams.size//16,self.hparams.size//16)
-        return preds
-class PatchExpanding3D(nn.Module):
-    """3D Patch Expanding Layer (inverse of patch merging)"""
-    def __init__(self, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.expand = nn.Linear(dim, 2 * dim, bias=False)
-        self.norm = norm_layer(dim // 2)
-
-    def forward(self, x):
+    def patchify(self, x):
         """
-        x: B, T, H, W, C
+        Convert video to patches.
+        x: (B, C, D, H, W)
+        Returns: (B, num_patches, patch_dim)
         """
-        B, T, H, W, C = x.shape
-        x = self.expand(x)  # B, T, H, W, 2*C
-
-        # Rearrange to upsample spatially
-        x = x.view(B, T, H, W, 2, 2, C // 2)
-        x = x.permute(0, 1, 2, 4, 3, 5, 6).contiguous()  # B, T, H, 2, W, 2, C//2
-        x = x.view(B, T, H * 2, W * 2, C // 2)
-        x = self.norm(x)
+        B, C, D, H, W = x.shape
+        pd, ph, pw = self.patch_size
+        
+        # Reshape to patches
+        x = x.reshape(B, C, 
+                     D // pd, pd,
+                     H // ph, ph,
+                     W // pw, pw)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+        x = x.reshape(B, -1, C * pd * ph * pw)
+        
         return x
-
-
-class SwinDecoderStage(nn.Module):
-    """Decoder stage using Swin Transformer blocks from encoder"""
-    def __init__(self, encoder_stage):
-        super().__init__()
-        # Clone the encoder stage blocks
-        self.blocks = nn.Sequential(*[block for block in encoder_stage])
     
-    def forward(self, x):
-        return self.blocks(x)
-
-
-class Swin3DEncoder(nn.Module):
-    """Encapsulated Swin3D encoder with 1-channel input support"""
-    def __init__(self, pretrained_ckpt='pretraining/checkpoints/64_tiny_16_epoch=62.ckpt', in_chans=1):
-        super().__init__()
-        # Load Swin3D backbone
-        self.backbone = swin_transformer.swin3d_t(weights='KINETICS400_V1')
-        # self/backbone = swin_transformer.SwinTransformer3d(
-        #     patch_size=[2, 4, 4],      # temporal=2, spatial=4x4 patches
-        #     embed_dim=192,              # base dimension
-        #     depths=[2, 2, 12],       # Tiny config
-        #     num_heads=[3, 6, 12],  # heads per stage
-        #     window_size=[8, 7, 7],     # attention window
-        #     stochastic_depth_prob=0.1, # DropPath
-        # )
-        # self.backbone = swin_transformer.SwinTransformer3d(
-        #     patch_size=[16, 4, 4],      # temporal=2, spatial=4x4 patches
-        #     embed_dim=96,              # base dimension
-        #     depths=[2, 2, 12, 2],       # Tiny config
-        #     num_heads=[3, 6, 12, 24],  # heads per stage
-        #     window_size=[2, 7, 7],     # attention window
-        #     stochastic_depth_prob=0.1, # DropPath
-        # )
-
-        # --- patch_embed adaptation for 1 channel ---
-        old_conv = self.backbone.patch_embed.proj
-        weight = old_conv.weight.sum(dim=1, keepdim=True)  # [128, 1, 2, 4, 4]
-        bias = old_conv.bias
-
-        self.backbone.patch_embed.proj = nn.Conv3d(
-            in_channels=in_chans,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            bias=True
-        )
-        self.backbone.patch_embed.proj.weight = nn.Parameter(weight)
-        self.backbone.patch_embed.proj.bias = nn.Parameter(bias.clone())
-
-        # Remove classifier head, keep norm
-        self.backbone.head = nn.Identity()
-
-    def forward(self, x):
-        x = self.backbone.patch_embed(x)   # (B, T/2, H/4, W/4, 96)
-        x = self.backbone.pos_drop(x)
-
-        skips = []
-        # backbone.features = [stage0, PatchMerging, stage1, PatchMerging, stage2, PatchMerging, stage3]
-        for block in self.backbone.features:
-            x = block(x)
-            if isinstance(block, nn.Sequential):  # stage output
-                skips.append(x)
-
-        return skips  # [stage0, stage1, stage2, stage3]
-
-
-class SwinUNet3D(nn.Module):
-    """Swin-UNet architecture adapted for 3D input (using Swin3D blocks in decoder)"""
-    def __init__(self, num_classes=1, embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24]):
-        super().__init__()
-        self.num_classes = num_classes
-
-        # ===== ENCODER =====
-        self.encoder = Swin3DEncoder(in_chans=1)
-
-        # Feature dimensions from Swin3D-tiny
-        self.dims = [96, 192, 384, 768]
-        # self.dims = [128, 256, 512, 1024]
-
-        # Extract encoder stages for reuse in decoder
-        encoder_stages = []
-        for block in self.encoder.backbone.features:
-            if isinstance(block, nn.Sequential):
-                encoder_stages.append(block)
-        
-        # ===== DECODER (Patch Expanding + Swin Transformer Blocks) =====
-        self.decoder1_expand = PatchExpanding3D(dim=self.dims[3])
-        self.decoder1_swin = SwinDecoderStage(encoder_stages[2])  # stage2 blocks
-
-        self.decoder2_expand = PatchExpanding3D(dim=self.dims[2])
-        self.decoder2_swin = SwinDecoderStage(encoder_stages[1])  # stage1 blocks
-
-        self.decoder3_expand = PatchExpanding3D(dim=self.dims[1])
-        self.decoder3_swin = SwinDecoderStage(encoder_stages[0])  # stage0 blocks
-
-        # ===== SEGMENTATION HEAD (Transformer-based) =====
-        final_dim = self.dims[1]  # 96
-        self.segmentation_head = nn.Sequential(
-            nn.LayerNorm(final_dim),
-            nn.Linear(final_dim, final_dim),
-            nn.GELU(),
-            nn.Linear(final_dim, num_classes)
-        )
-
-
-def forward(self, x):
-        B, C, T, H, W = x.shape
-
-        # ===== ENCODER =====
-        skips = self.encoder(x)  # [stage0, stage1, stage2, stage3]
-        x = skips[-1]  # bottleneck
-
-        # ===== DECODER =====
-        # stage3 (768) -> stage2 (384)
-        x = self.decoder1_expand(x)
-        x = x + skips[2]
-        x = self.decoder1_swin(x)
-
-        # stage2 (384) -> stage1 (192)
-        x = self.decoder2_expand(x)
-        x = x + skips[1]
-        x = self.decoder2_swin(x)
-
-        # # stage1 (192) -> stage0 (96)
-        # x = self.decoder3_expand(x)
-        # x = x + skips[0]
-        # x = self.decoder3_swin(x)
-
-        # No final expand - output at 1/4 resolution
-        # x shape: B, T, H/4, W/4, 96
-
-        # ===== 3D → 2D =====
-        # Temporal average: B, T, H, W, C -> B, H, W, C
-        x = x.max(dim=1)[0]
-
-        # ===== SEGMENTATION HEAD =====
-        # Apply per-pixel classification
-        B, H, W, C = x.shape
-        x = x.view(B * H * W, C)
-        out = self.segmentation_head(x)
-        out = out.view(B, H, W, self.num_classes)
-        out = out.permute(0, 3, 1, 2)  # B, num_classes, H, W
-
-        return out
-
-
-class SwinModel(pl.LightningModule):
-    def __init__(self, pred_shape, size, lr, scheduler=None, wandb_logger=None, freeze=False, 
-                 checkpoint_path=None, load_encoder_only=False):
-        super().__init__()
-        self.save_hyperparameters()
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        self.IGNORE_INDEX = 127
-
-        # Losses
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary', ignore_index=self.IGNORE_INDEX)
-        self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15, ignore_index=self.IGNORE_INDEX)
-        self.loss_func = lambda x, y: 0.5 * self.loss_func1(x, y) + 0.5 * self.loss_func2(x, y)
-
-        # Swin-Unet 3D backbone
-        self.backbone = SwinUNet3D(
-            num_classes=1,
-            embed_dim=96,
-            depths=[2, 2, 2, 2],
-            num_heads=[3, 6, 12, 24]
-        )
-        # checkpoint_path = 'pretraining/checkpoints/tiny_epoch=71.ckpt'
-        # Load pretrained weights if provided
-        if checkpoint_path:
-            self.load_pretrained_weights(checkpoint_path, load_encoder_only)
-
-        if freeze:
-            self._freeze_encoder()
-
-    def load_pretrained_weights(self, checkpoint_path, encoder_only=False):
-        """Load pretrained weights from checkpoint"""
-        print(f"Loading weights from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only=False)
-        
-        # Handle different checkpoint formats
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-        
-        if encoder_only:
-            # Load only encoder weights
-            encoder_state = {k.replace('backbone.encoder.', ''): v 
-                           for k, v in state_dict.items() 
-                           if k.startswith('backbone.encoder.')}
-            self.backbone.encoder.load_state_dict(encoder_state, strict=False)
-            print(f"Loaded encoder weights only ({len(encoder_state)} keys)")
-        else:
-            # Load full model weights
-            self.load_state_dict(state_dict, strict=False)
-            print(f"Loaded full model weights ({len(state_dict)} keys)")
-
-    def _freeze_encoder(self):
-        """Freeze encoder parameters"""
-        for param in self.backbone.encoder.parameters():
-            param.requires_grad = False
-        print("Encoder frozen")
-
-class PatchExpanding3D(nn.Module):
-    """3D Patch Expanding Layer (inverse of patch merging)"""
-    def __init__(self, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.expand = nn.Linear(dim, 2 * dim, bias=False)
-        self.norm = norm_layer(dim // 2)
-
-    def forward(self, x):
+    def unpatchify(self, x):
         """
-        x: B, T, H, W, C
+        Convert patches back to video.
+        x: (B, num_patches, patch_dim)
+        Returns: (B, C, D, H, W)
         """
-        B, T, H, W, C = x.shape
-        x = self.expand(x)  # B, T, H, W, 2*C
-
-        # Rearrange to upsample spatially
-        x = x.view(B, T, H, W, 2, 2, C // 2)
-        x = x.permute(0, 1, 2, 4, 3, 5, 6).contiguous()  # B, T, H, 2, W, 2, C//2
-        x = x.view(B, T, H * 2, W * 2, C // 2)
-        x = self.norm(x)
+        B = x.shape[0]
+        pd, ph, pw = self.patch_size
+        D, H, W = self.img_size
+        gd, gh, gw = self.patch_grid
+        
+        x = x.reshape(B, gd, gh, gw, self.in_channels, pd, ph, pw)
+        x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        x = x.reshape(B, self.in_channels, D, H, W)
+        
         return x
+    
+    def random_masking(self, x, mask_ratio):
+        """
+        Random masking following MAE.
+        x: (B, N, D)
+        Returns:
+            x_masked: (B, N_keep, D)
+            mask: (B, N) binary mask (1 = masked, 0 = keep)
+            ids_restore: (B, N) to restore original order
+        """
+        B, N, D = x.shape
+        len_keep = int(N * (1 - mask_ratio))
+        
+        noise = torch.rand(B, N, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        
+        mask = torch.ones([B, N], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        
+        return x_masked, mask, ids_restore
+    
+    def forward_encoder(self, x, mask_ratio):
+        """
+        Forward through encoder with masking.
+        x: (B, C, D, H, W) or (B, T, C, H, W) - handle both formats
 
+        For Swin3D compatibility, we pass the full input through the encoder,
+        then apply masking to the output features (similar to VideoMAE approach)
+        """
+        # Handle input format
+        if x.dim() == 5 and x.shape[2] == 1:  # (B, T, C, H, W) with C=1
+            x = x.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        elif x.dim() == 5:  # (B, T, C, H, W)
+            x = x.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
-class SwinDecoderStage(nn.Module):
-    """Decoder stage using Swin Transformer blocks from encoder"""
-    def __init__(self, encoder_stage):
-        super().__init__()
-        # Clone the encoder stage blocks
-        self.blocks = nn.Sequential(*[block for block in encoder_stage])
+        B = x.shape[0]
+
+        # Patchify for target
+        x_patches = self.patchify(x)  # (B, N, patch_dim)
+
+        # Forward through encoder (full input)
+        latent = self.encoder.forward_features(x)  # (B, L, encoder_dim)
+
+        # Now apply masking to the latent features
+        # Note: encoder may have downsampled, so latent has fewer tokens than patches
+        # We need to match the masking to the encoder output size
+
+        # Create mask for original patch space
+        _, mask, ids_restore = self.random_masking(x_patches, mask_ratio)
+
+        # For simplicity, we'll keep all encoder outputs and mask during loss computation
+        # This is similar to how some MAE variants work
+
+        return latent, mask, ids_restore, x_patches
+    
+    def forward_decoder(self, latent, ids_restore):
+        """
+        Forward through decoder.
+        latent: (B, L, encoder_dim) - encoder output
+        ids_restore: (B, N) - indices to restore order
+        """
+        B = latent.shape[0]
+        
+        # Project encoder features to decoder dimension
+        x = self.decoder_embed(latent)  # (B, L, decoder_dim)
+        
+        # Expand to full sequence with mask tokens
+        N = self.num_patches
+        L = x.shape[1]
+        
+        # Create mask tokens for missing patches
+        mask_tokens = self.mask_token.repeat(B, N - L, 1)
+        
+        # Concatenate visible + mask tokens
+        x_full = torch.cat([x, mask_tokens], dim=1)  # (B, N, decoder_dim)
+        
+        # Unshuffle
+        x_full = torch.gather(x_full, dim=1, 
+                             index=ids_restore.unsqueeze(-1).repeat(1, 1, x_full.shape[2]))
+        
+        # Add positional embedding
+        x_full = x_full + self.decoder_pos_embed
+        
+        # Apply decoder
+        x_dec = self.decoder(x_full)
+        
+        # Predict patches
+        pred = self.decoder_pred(x_dec)
+        
+        return pred
     
     def forward(self, x):
-        return self.blocks(x)
-
-
-class Swin3DEncoder(nn.Module):
-    """Encapsulated Swin3D encoder with 1-channel input support"""
-    def __init__(self, pretrained_ckpt='pretraining/checkpoints/64_tiny_16_epoch=62.ckpt', in_chans=1):
-        super().__init__()
-        # Load Swin3D backbone
-        self.backbone = swin_transformer.swin3d_t(weights='KINETICS400_V1')
-        # self/backbone = swin_transformer.SwinTransformer3d(
-        #     patch_size=[2, 4, 4],      # temporal=2, spatial=4x4 patches
-        #     embed_dim=192,              # base dimension
-        #     depths=[2, 2, 12],       # Tiny config
-        #     num_heads=[3, 6, 12],  # heads per stage
-        #     window_size=[8, 7, 7],     # attention window
-        #     stochastic_depth_prob=0.1, # DropPath
-        # )
-        # self.backbone = swin_transformer.SwinTransformer3d(
-        #     patch_size=[16, 4, 4],      # temporal=2, spatial=4x4 patches
-        #     embed_dim=96,              # base dimension
-        #     depths=[2, 2, 12, 2],       # Tiny config
-        #     num_heads=[3, 6, 12, 24],  # heads per stage
-        #     window_size=[2, 7, 7],     # attention window
-        #     stochastic_depth_prob=0.1, # DropPath
-        # )
-
-        # --- patch_embed adaptation for 1 channel ---
-        old_conv = self.backbone.patch_embed.proj
-        weight = old_conv.weight.sum(dim=1, keepdim=True)  # [128, 1, 2, 4, 4]
-        bias = old_conv.bias
-
-        self.backbone.patch_embed.proj = nn.Conv3d(
-            in_channels=in_chans,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            bias=True
-        )
-        self.backbone.patch_embed.proj.weight = nn.Parameter(weight)
-        self.backbone.patch_embed.proj.bias = nn.Parameter(bias.clone())
-
-        # Remove classifier head, keep norm
-        self.backbone.head = nn.Identity()
-
-    def forward(self, x):
-        x = self.backbone.patch_embed(x)   # (B, T/2, H/4, W/4, 96)
-        x = self.backbone.pos_drop(x)
-
-        skips = []
-        # backbone.features = [stage0, PatchMerging, stage1, PatchMerging, stage2, PatchMerging, stage3]
-        for block in self.backbone.features:
-            x = block(x)
-            if isinstance(block, nn.Sequential):  # stage output
-                skips.append(x)
-
-        return skips  # [stage0, stage1, stage2, stage3]
-
-
-class SwinUNet3D(nn.Module):
-    """Swin-UNet architecture adapted for 3D input (using Swin3D blocks in decoder)"""
-    def __init__(self, num_classes=1, embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24]):
-        super().__init__()
-        self.num_classes = num_classes
-
-        # ===== ENCODER =====
-        self.encoder = Swin3DEncoder(in_chans=1)
-
-        # Feature dimensions from Swin3D-tiny
-        self.dims = [96, 192, 384, 768]
-        # self.dims = [128, 256, 512, 1024]
-
-        # Extract encoder stages for reuse in decoder
-        encoder_stages = []
-        for block in self.encoder.backbone.features:
-            if isinstance(block, nn.Sequential):
-                encoder_stages.append(block)
+        """
+        Full forward pass.
+        x: (B, T, C, H, W) or (B, C, D, H, W)
+        """
+        # Encode with masking
+        latent, mask, ids_restore, target = self.forward_encoder(x, self.mask_ratio)
         
-        # ===== DECODER (Patch Expanding + Swin Transformer Blocks) =====
-        self.decoder1_expand = PatchExpanding3D(dim=self.dims[3])
-        self.decoder1_swin = SwinDecoderStage(encoder_stages[2])  # stage2 blocks
-
-        self.decoder2_expand = PatchExpanding3D(dim=self.dims[2])
-        self.decoder2_swin = SwinDecoderStage(encoder_stages[1])  # stage1 blocks
-
-        self.decoder3_expand = PatchExpanding3D(dim=self.dims[1])
-        self.decoder3_swin = SwinDecoderStage(encoder_stages[0])  # stage0 blocks
-
-        # ===== SEGMENTATION HEAD (Transformer-based) =====
-        final_dim = self.dims[1]  # 96
-        self.segmentation_head = nn.Sequential(
-            nn.LayerNorm(final_dim),
-            nn.Linear(final_dim, final_dim),
-            nn.GELU(),
-            nn.Linear(final_dim, num_classes)
-        )
-
-
-    def forward(self, x):
-        B, C, T, H, W = x.shape
-
-        # ===== ENCODER =====
-        skips = self.encoder(x)  # [stage0, stage1, stage2, stage3]
-        x = skips[-1]  # bottleneck
-
-        # ===== DECODER =====
-        # stage3 (768) -> stage2 (384)
-        x = self.decoder1_expand(x)
-        x = x + skips[2]
-        x = self.decoder1_swin(x)
-
-        # stage2 (384) -> stage1 (192)
-        x = self.decoder2_expand(x)
-        x = x + skips[1]
-        x = self.decoder2_swin(x)
-
-        # # stage1 (192) -> stage0 (96)
-        # x = self.decoder3_expand(x)
-        # x = x + skips[0]
-        # x = self.decoder3_swin(x)
-
-        # No final expand - output at 1/4 resolution
-        # x shape: B, T, H/4, W/4, 96
-
-        # ===== 3D → 2D =====
-        # Temporal average: B, T, H, W, C -> B, H, W, C
-        x = x.max(dim=1)[0]
-
-        # ===== SEGMENTATION HEAD =====
-        # Apply per-pixel classification
-        B, H, W, C = x.shape
-        x = x.view(B * H * W, C)
-        out = self.segmentation_head(x)
-        out = out.view(B, H, W, self.num_classes)
-        out = out.permute(0, 3, 1, 2)  # B, num_classes, H, W
-
-        return out
-
-
-class SwinModel(pl.LightningModule):
-    def __init__(self, pred_shape, size, lr, scheduler=None, wandb_logger=None, freeze=False, 
-                 checkpoint_path=None, load_encoder_only=False):
-        super().__init__()
-        self.save_hyperparameters()
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        self.IGNORE_INDEX = 127
-
-        # Losses
-        self.loss_func1 = smp.losses.DiceLoss(mode='binary', ignore_index=self.IGNORE_INDEX)
-        self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15, ignore_index=self.IGNORE_INDEX)
-        self.loss_func = lambda x, y: 0.5 * self.loss_func1(x, y) + 0.5 * self.loss_func2(x, y)
-
-        # Swin-Unet 3D backbone
-        self.backbone = SwinUNet3D(
-            num_classes=1,
-            embed_dim=96,
-            depths=[2, 2, 2, 2],
-            num_heads=[3, 6, 12, 24]
-        )
-        # checkpoint_path = 'pretraining/checkpoints/tiny_epoch=71.ckpt'
-        # Load pretrained weights if provided
-        if checkpoint_path:
-            self.load_pretrained_weights(checkpoint_path, load_encoder_only)
-
-        if freeze:
-            self._freeze_encoder()
-
-    def load_pretrained_weights(self, checkpoint_path, encoder_only=False):
-        """Load pretrained weights from checkpoint"""
-        print(f"Loading weights from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only=False)
+        # Decode
+        pred = self.forward_decoder(latent, ids_restore)
         
-        # Handle different checkpoint formats
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-        
-        if encoder_only:
-            # Load only encoder weights
-            encoder_state = {k.replace('backbone.encoder.', ''): v 
-                           for k, v in state_dict.items() 
-                           if k.startswith('backbone.encoder.')}
-            self.backbone.encoder.load_state_dict(encoder_state, strict=False)
-            print(f"Loaded encoder weights only ({len(encoder_state)} keys)")
-        else:
-            # Load full model weights
-            self.load_state_dict(state_dict, strict=False)
-            print(f"Loaded full model weights ({len(state_dict)} keys)")
-
-    def _freeze_encoder(self):
-        """Freeze encoder parameters"""
-        for param in self.backbone.encoder.parameters():
-            param.requires_grad = False
-        print("Encoder frozen")
-    def forward(self, x):
-        # x shape: [B, C, T, H, W] where C=1 (single channel)
-        x = x.permute(0, 2, 1, 3, 4)  # Change to [B, T, C, H, W] for Swin3D
-        output = self.backbone(x)
-        return output
+        return pred, target, mask
+    
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        outputs = self(x)
-        # print(outputs.shape)
-        # print(y.shape)
-        loss = self.loss_func(outputs, y)
-        if torch.isnan(loss):
-            print("Loss nan encountered")
-        self.log("train/total_loss", loss.item(),on_step=True, on_epoch=True, prog_bar=True)
-        opt = self.optimizers()
-        current_lr = opt.param_groups[0]['lr']
-        self.log("train/lr", current_lr, on_step=True, on_epoch=True, prog_bar=True)
-        return {"loss": loss}
-
+        x = batch
+        
+        # Forward pass
+        pred, target, mask = self(x)
+        
+        # Compute loss only on masked patches
+        loss = self.criterion(pred[mask.bool()], target[mask.bool()])
+        
+        self.log('train_loss', loss, prog_bar=True, logger=True, sync_dist=True)
+        return loss
+    
     def validation_step(self, batch, batch_idx):
-        x,y,xyxys= batch
-        outputs = self(x)
-
-        loss1 = self.loss_func(outputs, y)
-        y_preds = torch.sigmoid(outputs).to('cpu')
-        for i, (x1, y1, x2, y2) in enumerate(xyxys):
-            self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=8,mode='bilinear').squeeze(0).squeeze(0).numpy()
-            self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
-
-        self.log("val/total_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
-        return {"loss": loss1}
+        x = batch
         
-    def configure_optimizers(self):
-        weight_decay = 0.
-        base_lr = self.hparams.lr
-
-        # 1️⃣ Backbone parameters in their own group
-        backbone_params = list(self.parameters())
-
-        # 5 4Optimizer
-        optimizer = AdamW(backbone_params, lr=base_lr, weight_decay=weight_decay)
-
-        # 6 Scheduler
-        return [optimizer]
-
+        # Forward pass
+        pred, target, mask = self(x)
+        
+        # Compute loss only on masked patches
+        loss = self.criterion(pred[mask.bool()], target[mask.bool()])
+        
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        
+        # Save for visualization
+        if batch_idx == 0:
+            # Reconstruct full image
+            pred_img = self.unpatchify(pred)
+            target_img = self.unpatchify(target)
+            
+            # Convert back to (B, T, C, H, W) format
+            if pred_img.shape[1] == 1:
+                pred_img = pred_img.permute(0, 2, 1, 3, 4)
+                target_img = target_img.permute(0, 2, 1, 3, 4)
+            
+            self.val_batch_for_viz = (target_img, pred_img)
+        
+        return loss
+    
     def on_validation_epoch_end(self):
-        mask_pred_tensor = torch.tensor(self.mask_pred, dtype=torch.float32, device=self.device)
-        mask_count_tensor = torch.tensor(self.mask_count, dtype=torch.float32, device=self.device)
-
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(mask_pred_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(mask_count_tensor, op=dist.ReduceOp.SUM)
-
-        if self.trainer.is_global_zero:
-            mask_pred_np = mask_pred_tensor.cpu().numpy()
-            mask_count_np = mask_count_tensor.cpu().numpy()
-            final_mask = np.divide(
-                mask_pred_np,
-                mask_count_np,
-                out=np.zeros_like(mask_pred_np),
-                where=mask_count_np != 0
-            )
-
-            self.hparams.wandb_logger.log_image(key="masks", images=[np.clip(final_mask, 0, 1)], caption=["probs"])
-
-        self.mask_pred = np.zeros(self.hparams.pred_shape)
-        self.mask_count = np.zeros(self.hparams.pred_shape)
-        
-        
-def load_weights(model, ckpt_path, strict=True, map_location='cpu'):
-    """
-    Loads weights from a checkpoint into the model.
+        if self.global_rank == 0 and hasattr(self, 'val_batch_for_viz'):
+            target, pred = self.val_batch_for_viz
+            visualize_reconstruction(target, pred, sample_idx=0, num_frames=16, 
+                                   epoch=self.current_epoch)
     
-    Args:
-        model: An instance of TimesfomerModel.
-        ckpt_path: Path to the .ckpt file saved by PyTorch Lightning.
-        strict: Whether to strictly enforce that the keys in state_dict match.
-        map_location: Where to load the checkpoint (e.g., 'cpu', 'cuda').
-
-    Returns:
-        model: The model with loaded weights.
-    """
-    ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
-    
-    # For Lightning checkpoints, weights are under 'state_dict'
-    if 'state_dict' in ckpt:
-        state_dict = ckpt['state_dict']
-    else:
-        state_dict = ckpt
-
-    # Strip 'model.' prefix if saved with Lightning
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        new_key = k.replace("model.", "") if k.startswith("model.") else k
-        new_state_dict[new_key] = v
-
-    missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=strict)
-    
-    print("Loaded checkpoint from:", ckpt_path)
-    print("Missing keys:", missing_keys)
-    print("Unexpected keys:", unexpected_keys)
-
-    return model
-        
-class GradualWarmupSchedulerV2(GradualWarmupScheduler):
-    """
-    https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
-    """
-    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
-        super(GradualWarmupSchedulerV2, self).__init__(
-            optimizer, multiplier, total_epoch, after_scheduler)
-
-    def get_lr(self):
-        if self.last_epoch > self.total_epoch:
-            if self.after_scheduler:
-                if not self.finished:
-                    self.after_scheduler.base_lrs = [
-                        base_lr * self.multiplier for base_lr in self.base_lrs]
-                    self.finished = True
-                return self.after_scheduler.get_lr()
-            return [base_lr * self.multiplier for base_lr in self.base_lrs]
-        if self.multiplier == 1.0:
-            return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
-        else:
-            return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
-
-def get_scheduler(optimizer, scheduler=None, epochs=15, steps_per_epoch=10):
-    if scheduler == "onecycle":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=[group['lr'] for group in optimizer.param_groups],
-            total_steps=epochs * 50,
-            pct_start=0.1,       # 10% warmup
-            anneal_strategy='cos',  # Cosine decay after warmup
-            cycle_momentum=False  # Turn off momentum scheduling (common for AdamW)
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.lr,
+            weight_decay=0.05,
+            betas=(0.9, 0.95)
         )
-    elif scheduler == 'cosine':
-        scheduler_after = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, epochs, eta_min=1e-6)
-        scheduler = GradualWarmupSchedulerV2(
-            optimizer, multiplier=1.0, total_epoch=4, after_scheduler=scheduler_after)
-    elif scheduler == 'linear':
-        scheduler_after = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.05, total_iters=epochs)
-        scheduler = GradualWarmupSchedulerV2(
-            optimizer, multiplier=5.0, total_epoch=4, after_scheduler=scheduler_after)
+        
+        # Cosine scheduler with warmup
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.trainer.max_epochs
+        )
+        
+        scheduler = GradualWarmupScheduler(
+            optimizer,
+            multiplier=1,
+            total_epoch=5,
+            after_scheduler=cosine_scheduler
+        )
+        
+        return [optimizer], [scheduler]
 
-    return scheduler
+
+def main():
+    # ========== Data Loading ==========
+    print("Loading datasets...")
+    full_train_dataset = TileDataset(
+        CFG.segment_path, 
+        splits=["train", "valid"], 
+        transform=get_transforms('train', CFG)
+    )
+    
+    val_size = int(0.01 * len(full_train_dataset))
+    train_size = len(full_train_dataset) - val_size
+    
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=CFG.train_batch_size, 
+        shuffle=True, 
+        num_workers=CFG.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=CFG.valid_batch_size, 
+        shuffle=False, 
+        num_workers=CFG.num_workers,
+        pin_memory=True
+    )
+    
+    print(f"Train loader length: {len(train_loader)}")
+    print(f"Val loader length: {len(val_loader)}")
+    
+    # ========== Model ==========
+    print("Creating Swin3D MAE model...")
+    # Input: (16, 224, 224)
+    # After patch embed (2,4,4): (8, 56, 56)
+    # Window size must divide evenly: 56 = 7*8, so use (4, 7, 7) or (2, 8, 8)
+    model = Swin3DMAE(
+        img_size=(16, 224, 224),
+        patch_size=(2, 4, 4),
+        in_channels=1,
+        embed_dim=96,           # Tiny config
+        depths=(2, 2, 6, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=(4, 7, 7),  # Fixed: (8,56,56) -> 4 divides 8, 7 divides 56
+        decoder_embed_dim=512,
+        decoder_depth=4,
+        decoder_num_heads=8,
+        mask_ratio=0.75,
+        lr=1e-4
+    )
+    
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    
+    # ========== Training ==========
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="swin3d_mae_{epoch}",
+        save_top_k=-1,
+        every_n_epochs=1
+    )
+    
+    trainer = pl.Trainer(
+        max_epochs=200,
+        accelerator="auto",
+        devices=-1,
+        strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
+        log_every_n_steps=20,
+        check_val_every_n_epoch=1,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
+        callbacks=[checkpoint_callback],
+        precision=16  # Mixed precision training
+    )
+    
+    print("Starting training...")
+    trainer.fit(model, train_loader, val_loader)
+
+
+if __name__ == "__main__":
+    main()
 
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch) 
