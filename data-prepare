@@ -1,61 +1,81 @@
+"""
+Data Preprocessing for MAE Pretraining
+Cuts 3D volumetric data into tiles and saves as .npy files
+"""
+
 import os
 import numpy as np
-import PIL
 import cv2
 from tqdm.auto import tqdm
-from PIL import Image
 
-# Now you can set MAX_IMAGE_PIXELS
+# Increase PIL image size limit
+import PIL
+from PIL import Image
 Image.MAX_IMAGE_PIXELS = 933120000
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 
 """
 This script reads fragment images and their corresponding masks, preprocesses them by extracting tiles,
-and saves the tiles into separate directories for training and validation datasets.
+and saves the tiles into separate directories for MAE pretraining.
 """
+
 
 class CFG:
     # ============== comp exp name =============
     current_dir = '../'
     segment_path = './pretraining_scrolls/'
-    
+
+    # Data parameters
     start_idx = 20
     in_chans = 20
-    
+
+    # Tile parameters
     size = 224
     tile_size = 224
-    stride = tile_size // 4
-    
+    stride = tile_size // 4  # 56, creates overlapping tiles
+
+    # Processing
     num_workers = 16
-    
-    # Change the size of fragments
-    frags_ratio1 = ['frag','re']
-    frags_ratio2 = ['202','s4','left']
+
+    # Fragment scaling
+    frags_ratio1 = ['frag', 're']
+    frags_ratio2 = ['202', 's4', 'left']
     ratio1 = 2
-    ratio2 = 2
-    
-    # ============== fold =============
-    segments = ['20240304141531'] 
+    ratio2 = 2  # FIXED: Changed from 1 to 2 to match other files
+
+    # Fragments to process
+    segments = ['20240304141531']
     valid_id = '20240304141531'
-    
+
 
 def read_image_mask(fragment_id, CFG=None):
-    """ 
-    Reads a fragment image and its corresponding masks.    
+    """
+    Reads a fragment image and its corresponding mask.
+
+    Args:
+        fragment_id: Fragment identifier
+        CFG: Configuration object
+
+    Returns:
+        images: (H, W, in_chans) numpy array
+        fragment_mask: (H, W) numpy array
     """
     images = []
-    start_idx = CFG.start_idx 
+    start_idx = CFG.start_idx
     end_idx = start_idx + CFG.in_chans
-    
+
     idxs = range(start_idx, end_idx)
     image_shape = 0
-    try:
 
-        for i in tqdm(idxs):
+    try:
+        print(f"Loading layers {start_idx}-{end_idx-1} for {fragment_id}")
+
+        for i in tqdm(idxs, desc=f"Reading {fragment_id}"):
             tif_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.tif")
             jpg_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.jpg")
-            png_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.png") 
-            
+            png_path = os.path.join(CFG.segment_path, fragment_id, "layers", f"{i:02}.png")
+
+            # Load image from available format
             if os.path.exists(tif_path):
                 image = cv2.imread(tif_path, 0)
             elif os.path.exists(jpg_path):
@@ -63,136 +83,189 @@ def read_image_mask(fragment_id, CFG=None):
             else:
                 image = cv2.imread(png_path, 0)
 
+            # Pad image to be divisible by tile_size
             pad0 = (CFG.tile_size - image.shape[0] % CFG.tile_size) % CFG.tile_size
             pad1 = (CFG.tile_size - image.shape[1] % CFG.tile_size) % CFG.tile_size
-            image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0) 
-            
-            # Resize the image to match the expected size
-            if (any(sub in fragment_id for sub in CFG.frags_ratio1)):
+            image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
+
+            # Resize based on fragment type
+            if any(sub in fragment_id for sub in CFG.frags_ratio1):
                 scale = 1 / CFG.ratio1
-                new_w = int(image.shape[1] * scale) 
-                new_h = int(image.shape[0] * scale) 
-                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            elif (any(sub in fragment_id for sub in CFG.frags_ratio2)):
-                scale = 1 / CFG.ratio2
                 new_w = int(image.shape[1] * scale)
                 new_h = int(image.shape[0] * scale)
                 image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                scale = 1 / 1
+            elif any(sub in fragment_id for sub in CFG.frags_ratio2):
+                scale = 1 / CFG.ratio2
                 new_w = int(image.shape[1] * scale)
                 new_h = int(image.shape[0] * scale)
                 image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
             images.append(image)
-            
+
+        # Stack channels
         images = np.stack(images, axis=2)
-        print(f" Shape of {fragment_id} segment: {images.shape}")
-        
+        print(f"Shape of {fragment_id} segment: {images.shape}")
+
+        # Load fragment mask
         folder_path = f"{CFG.segment_path}{fragment_id}/"
-        # List all files in the folder that end with '_mask.png'
         mask_files = [f for f in os.listdir(folder_path) if f.endswith("_mask.png")]
 
         if mask_files:
-            path = os.path.join(folder_path, mask_files[0])  # pick the first matching file
+            path = os.path.join(folder_path, mask_files[0])
+            fragment_mask = cv2.imread(path, 0)
         else:
-            path = None  # or handle the case when no mask file exists
+            print(f"Warning: No mask file found for {fragment_id}")
+            # Create full mask (all valid)
+            fragment_mask = np.ones(images.shape[:2], dtype=np.uint8) * 255
 
-        fragment_mask = cv2.imread(path,0)
-
+        # Resize mask to match image
         fragment_mask = cv2.resize(fragment_mask, (images.shape[1], images.shape[0]), interpolation=cv2.INTER_AREA)
-            
-    except:
-            print(fragment_id,"no used")
-            return None, None
+
+    except Exception as e:
+        print(f"Error reading {fragment_id}: {e}")
+        return None, None
+
     return images, fragment_mask
 
 
 def get_train_valid_dataset(CFG=None):
+    """
+    Extract tiles from fragments for MAE pretraining.
+
+    Returns:
+        train_images: list of (size, size, in_chans) tiles
+        valid_images: list of (size, size, in_chans) tiles
+    """
     train_images = []
     valid_images = []
 
-    segments = CFG.segments  # List of segment IDs (subdirectory names or file prefixes)
-    path = CFG.segment_path  # Path to the directory containing all segments
-    
-    for i,fragment_id in enumerate(segments):
-        print(f"{i}/{len(segments)}")
+    segments = CFG.segments
+    path = CFG.segment_path
+
+    for i, fragment_id in enumerate(segments):
+        print(f"{i+1}/{len(segments)} Processing {fragment_id}")
         fragment_path = os.path.join(path, fragment_id)
 
         if not os.path.isdir(fragment_path):
-            continue  # Skip
+            print(f"Skipping {fragment_id} (directory not found)")
+            continue
 
-        print('reading', fragment_id)
-
-        # image, fragment_mask = read_image_mask(fragment_id, CFG=CFG)
         image, fragment_mask = read_image_mask(fragment_id, CFG)
-        if fragment_mask is None or fragment_mask is None:
-            # skip or handle
+
+        if image is None or fragment_mask is None:
+            print(f"Skipping {fragment_id} (loading failed)")
             continue
 
-
+        # Calculate tile positions
         x1_list = list(range(0, image.shape[1] - CFG.tile_size + 1, CFG.stride))
         y1_list = list(range(0, image.shape[0] - CFG.tile_size + 1, CFG.stride))
+
         windows_dict = {}
+        tiles_extracted = 0
 
         for a in y1_list:
             for b in x1_list:
+                # Check if window has valid fragment mask (no zeros)
                 if not np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
-                        for yi in range(0, CFG.tile_size, CFG.size):
-                            for xi in range(0, CFG.tile_size, CFG.size):
-                                y1 = a + yi
-                                x1 = b + xi
-                                y2 = y1 + CFG.size
-                                x2 = x1 + CFG.size
-                                # if (y1, y2, x1, x2) not in windows_dict:
-                                if fragment_id==CFG.valid_id:
-                                    valid_images.append(image[y1:y2, x1:x2])
-                                else:
-                                    train_images.append(image[y1:y2, x1:x2])
-                                assert image[y1:y2, x1:x2].shape == (CFG.size, CFG.size, CFG.in_chans)
-
-    return train_images,valid_images
-
-base_dir = CFG.segment_path
-# List only files directly in base_dir
-folders_in_base = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
-
-print("Files in base_dir:", folders_in_base)
-
-# Append only those folders to CFG.segments
-for folder in folders_in_base:
-    CFG.segments.append(folder)
-        
-def preprocess_and_save_tiles(CFG):
-    # Save tiles inside segment_path/tiles/train and segment_path/tiles/valid
-    train_dir = os.path.join(CFG.segment_path, "224_tiles", "train")
-    valid_dir = os.path.join(CFG.segment_path, "224_tiles", "valid")
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(valid_dir, exist_ok=True)
-
-    tile_counter = {"train": 0, "valid": 0}
-
-    for fragment_id in CFG.segments:
-        print(f"Processing {fragment_id}...")
-        image, mask = read_image_mask(fragment_id, CFG)
-        if image is None or mask is None:
-            continue
-
-        x1_list = list(range(0, image.shape[1] - CFG.tile_size + 1, CFG.stride))
-        y1_list = list(range(0, image.shape[0] - CFG.tile_size + 1, CFG.stride))
-
-        split = "valid" if fragment_id == CFG.valid_id else "train"
-        save_dir = valid_dir if split == "valid" else train_dir
-
-        for a in y1_list:
-            for b in x1_list:
-                if not np.any(mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
+                    # Extract tiles within window
                     for yi in range(0, CFG.tile_size, CFG.size):
                         for xi in range(0, CFG.tile_size, CFG.size):
                             y1 = a + yi
                             x1 = b + xi
                             y2 = y1 + CFG.size
                             x2 = x1 + CFG.size
+
+                            tile = image[y1:y2, x1:x2]
+
+                            # Verify tile shape
+                            assert tile.shape == (CFG.size, CFG.size, CFG.in_chans), \
+                                f"Unexpected tile shape: {tile.shape}"
+
+                            # Assign to train or valid
+                            if fragment_id == CFG.valid_id:
+                                valid_images.append(tile)
+                            else:
+                                train_images.append(tile)
+
+                            tiles_extracted += 1
+
+        print(f"Extracted {tiles_extracted} tiles from {fragment_id}")
+
+    print(f"\nTotal train tiles: {len(train_images)}")
+    print(f"Total valid tiles: {len(valid_images)}")
+
+    return train_images, valid_images
+
+
+def preprocess_and_save_tiles(CFG):
+    """
+    Preprocess fragments and save tiles as .npy files.
+
+    Output structure:
+        pretraining_scrolls/
+            224_tiles/
+                train/
+                    {fragment_id}_tile_000000.npy
+                    ...
+                valid/
+                    {fragment_id}_tile_000000.npy
+                    ...
+    """
+    # Create output directories
+    train_dir = os.path.join(CFG.segment_path, "224_tiles", "train")
+    valid_dir = os.path.join(CFG.segment_path, "224_tiles", "valid")
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(valid_dir, exist_ok=True)
+
+    print(f"Saving tiles to:")
+    print(f"  Train: {train_dir}")
+    print(f"  Valid: {valid_dir}\n")
+
+    tile_counter = {"train": 0, "valid": 0}
+
+    # Auto-detect fragments if not specified
+    base_dir = CFG.segment_path
+    if not CFG.segments or len(CFG.segments) == 0:
+        folders_in_base = [d for d in os.listdir(base_dir)
+                          if os.path.isdir(os.path.join(base_dir, d))]
+        print(f"Auto-detected fragments: {folders_in_base}")
+        CFG.segments = folders_in_base
+
+    for fragment_id in CFG.segments:
+        print(f"\n{'='*60}")
+        print(f"Processing {fragment_id}...")
+        print(f"{'='*60}")
+
+        image, mask = read_image_mask(fragment_id, CFG)
+
+        if image is None or mask is None:
+            print(f"Skipping {fragment_id} due to loading error\n")
+            continue
+
+        # Calculate tile positions
+        x1_list = list(range(0, image.shape[1] - CFG.tile_size + 1, CFG.stride))
+        y1_list = list(range(0, image.shape[0] - CFG.tile_size + 1, CFG.stride))
+
+        # Determine split (train/valid)
+        split = "valid" if fragment_id == CFG.valid_id else "train"
+        save_dir = valid_dir if split == "valid" else train_dir
+
+        print(f"Extracting and saving tiles to {split} set...")
+
+        tiles_saved = 0
+
+        for a in y1_list:
+            for b in x1_list:
+                # Check if window is valid
+                if not np.any(mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
+                    # Extract tiles
+                    for yi in range(0, CFG.tile_size, CFG.size):
+                        for xi in range(0, CFG.tile_size, CFG.size):
+                            y1 = a + yi
+                            x1 = b + xi
+                            y2 = y1 + CFG.size
+                            x2 = x1 + CFG.size
+
                             tile = image[y1:y2, x1:x2]
 
                             # Save tile
@@ -201,8 +274,32 @@ def preprocess_and_save_tiles(CFG):
                             np.save(save_path, tile)
 
                             tile_counter[split] += 1
+                            tiles_saved += 1
 
-    print("✅ Finished preprocessing.")
+        print(f"Saved {tiles_saved} tiles from {fragment_id}")
+
+    print(f"\n{'='*60}")
+    print("✅ Preprocessing completed!")
+    print(f"Train tiles: {tile_counter['train']}")
+    print(f"Valid tiles: {tile_counter['valid']}")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("Data Preprocessing for MAE Pretraining")
+    print("="*60 + "\n")
+
+    print("Configuration:")
+    print(f"  start_idx: {CFG.start_idx}")
+    print(f"  in_chans: {CFG.in_chans}")
+    print(f"  tile_size: {CFG.tile_size}")
+    print(f"  stride: {CFG.stride}")
+    print(f"  output size: {CFG.size}x{CFG.size}")
+    print()
+
+    preprocess_and_save_tiles(CFG)
+
     print(f"Saved {tile_counter['train']} train tiles, {tile_counter['valid']} valid tiles.")
 
 preprocess_and_save_tiles(CFG)
